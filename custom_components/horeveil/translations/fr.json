@@ -6,5 +6,16 @@
         "description": "Copiez le chemin et le jeton pour configurer votre relais Node-RED local, puis validez. Chaque récepteur est associé à la première installation Horéveil qui lui envoie un instantané valide.\n\nChemin du webhook : `{path}`\n\nEn-tête `X-Horeveil-Token` : `{token}`"
       }
     }
+  },
+  "entity": {
+    "sensor": {
+      "next_alarm": {"name": "Prochain réveil"},
+      "upcoming_alarms": {"name": "Nombre de réveils à venir"},
+      "calendar_received_at": {"name": "Dernière réception du calendrier"},
+      "calendar_freshness": {
+        "name": "Fraîcheur du calendrier",
+        "state": {"fresh": "À jour", "expired": "Périmé", "empty": "Jamais reçu"}
+      }
+    }
   }
 }

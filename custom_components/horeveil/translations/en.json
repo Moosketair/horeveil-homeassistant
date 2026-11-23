@@ -6,5 +6,16 @@
         "description": "Copy the path and token for your local Node-RED relay, then submit. Each receiver is bound to the first Horéveil installation that sends it a valid snapshot.\n\nWebhook path: `{path}`\n\n`X-Horeveil-Token` header: `{token}`"
       }
     }
+  },
+  "entity": {
+    "sensor": {
+      "next_alarm": {"name": "Next alarm"},
+      "upcoming_alarms": {"name": "Upcoming alarm count"},
+      "calendar_received_at": {"name": "Last calendar receipt"},
+      "calendar_freshness": {
+        "name": "Calendar freshness",
+        "state": {"fresh": "Fresh", "expired": "Expired", "empty": "Never received"}
+      }
+    }
   }
 }

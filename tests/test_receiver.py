@@ -80,39 +80,67 @@ class CalendarEntity:
         self.latest_state = (self.available, self.event)
 
 
+@dataclass
+class SensorEntityDescription:
+    key: str
+    translation_key: str
+    device_class: str | None = None
+    options: list[str] | None = None
+
+
+class SensorEntity(CalendarEntity):
+    def async_write_ha_state(self):
+        self.writes += 1
+        self.latest_state = (self.available, self.native_value, self.extra_state_attributes)
+
+
 class ConfigEntries:
     def __init__(self, hass):
         self.hass = hass
 
     async def async_forward_entry_setups(self, entry, platforms):
-        assert platforms == ("calendar",)
+        assert platforms == ("calendar", "sensor")
         entities = []
         await setup_calendar(self.hass, entry, entities.extend)
         self.calendar = entities[0]
-        self.calendar.hass = self.hass
-        await self.calendar.async_added_to_hass()
-        self.calendar.async_write_ha_state()
+        await setup_sensors(self.hass, entry, entities.extend)
+        self.sensors = {entity.entity_description.key: entity for entity in entities[1:]}
+        for entity in entities:
+            entity.hass = self.hass
+            await entity.async_added_to_hass()
+            entity.async_write_ha_state()
 
     async def async_unload_platforms(self, entry, platforms):
-        assert platforms == ("calendar",)
-        for callback in self.calendar.remove_callbacks:
-            callback()
+        assert platforms == ("calendar", "sensor")
+        for entity in (self.calendar, *self.sensors.values()):
+            for callback in entity.remove_callbacks:
+                callback()
         return True
 
 
+def add_callback(callbacks, key, callback):
+    registered = callbacks.setdefault(key, [])
+    registered.append(callback)
+
+    def cancel():
+        registered.remove(callback)
+        if not registered:
+            del callbacks[key]
+
+    return cancel
+
+
 def connect(hass, signal, callback):
-    hass.listeners[signal] = callback
-    return lambda: hass.listeners.pop(signal)
+    return add_callback(hass.listeners, signal, callback)
 
 
 def send(hass, signal):
-    if signal in hass.listeners:
-        hass.listeners[signal]()
+    for callback in hass.listeners.get(signal, ()):
+        callback()
 
 
 def track_time(hass, callback, point):
-    hass.timers[point] = callback
-    return lambda: hass.timers.pop(point)
+    return add_callback(hass.timers, point, callback)
 
 
 dt_api = SimpleNamespace(
@@ -155,8 +183,13 @@ with patch.dict(
             "homeassistant.components.calendar", CalendarEntity=CalendarEntity,
             CalendarEvent=CalendarEvent,
         ),
+        "homeassistant.components.sensor": fake_module(
+            "homeassistant.components.sensor", SensorEntity=SensorEntity,
+            SensorEntityDescription=SensorEntityDescription,
+            SensorDeviceClass=SimpleNamespace(TIMESTAMP="timestamp", ENUM="enum"),
+        ),
         "homeassistant.const": fake_module(
-            "homeassistant.const", Platform=SimpleNamespace(CALENDAR="calendar")
+            "homeassistant.const", Platform=SimpleNamespace(CALENDAR="calendar", SENSOR="sensor")
         ),
         "homeassistant.core": fake_module(
             "homeassistant.core", HomeAssistant=object, callback=lambda function: function
@@ -184,6 +217,7 @@ with patch.dict(
     from custom_components.horeveil.config_flow import HoreveilConfigFlow
     from custom_components.horeveil.const import RELAY_HEADER, RELAY_TOKEN, WEBHOOK_ID
     from custom_components.horeveil import receiver as receiver_module
+    from custom_components.horeveil.sensor import async_setup_entry as setup_sensors
     from custom_components.horeveil.snapshot import MAX_BYTES
 
 
@@ -194,7 +228,7 @@ EXAMPLE = json.loads(CONTRACT.read_text("utf-8").split("```json\n", 1)[1].split(
 class ReceiverTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.now = datetime.fromisoformat("2027-03-27T08:00:00Z")
-        self.enterContext(patch.object(receiver_module, "datetime")).now.side_effect = (
+        self.enterContext(patch.object(receiver_module, "datetime", wraps=datetime)).now.side_effect = (
             lambda _zone: self.now
         )
         self.enterContext(patch.object(dt_api, "utcnow", lambda: self.now))
@@ -235,6 +269,13 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
         if request.method not in options["allowed_methods"]:
             return web.Response(status=405)
         return await handler(self.hass, webhook_id, request)
+
+    def advance_to(self, instant):
+        self.now = instant
+        due = sorted(point for point in self.hass.timers if point <= instant)
+        for point in due:
+            for callback in self.hass.timers.pop(point, ()):
+                callback(point)
 
     async def post(self, snapshot=None, *, raw=None, headers=None, path=None):
         if raw is None:
@@ -516,10 +557,9 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_calendar_expires_at_deadline_without_new_webhook_and_recovers(self):
         await self.post(dict(EXAMPLE, expires_at="2027-03-28T08:00:00.000000001Z"))
-        deadline, = self.hass.timers
-        self.assertEqual(deadline, datetime.fromisoformat("2027-03-28T08:00:00.000001Z"))
-        self.now = deadline
-        self.hass.timers.pop(deadline)(deadline)
+        deadline = datetime.fromisoformat("2027-03-28T08:00:00.000001Z")
+        self.assertIn(deadline, self.hass.timers)
+        self.advance_to(deadline)
         self.assertEqual(self.calendar.latest_state, (False, None))
         self.assertEqual(await self.events(), [])
         await self.post(dict(EXAMPLE, revision=8, expires_at="2027-03-29T08:00:00Z"))
@@ -541,3 +581,102 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
         await self.start_receiver()
         self.assertFalse(self.calendar.available)
         self.assertEqual(await self.events(), [])
+
+    @property
+    def sensors(self):
+        return self.hass.config_entries.sensors
+
+    async def test_sensors_show_next_alarm_metadata_and_strict_future_count(self):
+        occurrence = EXAMPLE["occurrences"][0]
+        later = dict(
+            occurrence, occurrence_id=f"{occurrence['alarm_id']}/2027-03-29",
+            nominal_date="2027-03-29", sound_start="2027-03-29T05:00:00Z",
+            target_at="2027-03-29T05:05:00Z",
+        )
+        at_now = dict(
+            occurrence, occurrence_id=f"{occurrence['alarm_id']}/2027-03-26",
+            nominal_date="2027-03-26", sound_start=self.now.isoformat(),
+        )
+        await self.post(dict(EXAMPLE, occurrences=[later, at_now, occurrence]))
+        next_alarm = self.sensors["next_alarm"]
+        self.assertEqual(next_alarm.entity_description.device_class, "timestamp")
+        self.assertEqual(next_alarm.native_value, datetime.fromisoformat(occurrence["sound_start"]))
+        self.assertEqual(next_alarm.extra_state_attributes, {
+            "name": "Réveil du matin", "category": "Travail", "mode": "Matin",
+            "occurrence_id": occurrence["occurrence_id"], "target_at": occurrence["target_at"],
+        })
+        self.assertEqual(self.sensors["upcoming_alarms"].native_value, 2)
+
+    async def test_sensors_advance_at_sound_start_without_webhook_or_calendar_minute(self):
+        first = EXAMPLE["occurrences"][0]
+        later = dict(
+            first, occurrence_id=f"{first['alarm_id']}/2027-03-29",
+            nominal_date="2027-03-29", sound_start="2027-03-28T02:45:00Z",
+            target_at="2027-03-28T02:50:00Z",
+        )
+        await self.post(dict(EXAMPLE, occurrences=[first, later]))
+        first_time, later_time = (datetime.fromisoformat(row["sound_start"]) for row in (first, later))
+        self.advance_to(first_time)
+        self.assertEqual(self.sensors["next_alarm"].latest_state[1], later_time)
+        self.assertEqual(self.sensors["upcoming_alarms"].latest_state[1], 1)
+        self.assertEqual(self.calendar.event.start, first_time)
+        self.advance_to(later_time)
+        self.assertEqual(self.sensors["next_alarm"].latest_state, (True, None, None))
+        self.assertEqual(self.sensors["upcoming_alarms"].latest_state[1], 0)
+
+    async def test_sensors_distinguish_missing_empty_and_expired_snapshots(self):
+        next_alarm, count = (self.sensors[key] for key in ("next_alarm", "upcoming_alarms"))
+        freshness = self.sensors["calendar_freshness"]
+        receipt = self.sensors["calendar_received_at"]
+        self.assertEqual(freshness.native_value, "empty")
+        self.assertIsNone(receipt.native_value)
+        self.assertFalse(next_alarm.available)
+        self.assertFalse(count.available)
+        await self.post(dict(EXAMPLE, occurrences=[], alarms={}))
+        accepted_at = self.now
+        self.assertEqual(next_alarm.latest_state, (True, None, None))
+        self.assertEqual(count.latest_state, (True, 0, None))
+        self.assertEqual(freshness.native_value, "fresh")
+        self.advance_to(datetime.fromisoformat(EXAMPLE["expires_at"]))
+        self.assertEqual(freshness.latest_state[1], "expired")
+        self.assertEqual(next_alarm.latest_state, (False, None, None))
+        self.assertEqual(count.latest_state, (False, None, None))
+        self.assertEqual(receipt.latest_state[1], accepted_at)
+
+    async def test_sensors_keep_receipt_across_duplicate_failure_and_restart(self):
+        first_received = self.now
+        await self.post()
+        self.now += timedelta(minutes=1)
+        self.assertEqual((await self.post())[1], {"result": "duplicate"})
+        self.hass.store.fail = True
+        self.assertEqual((await self.post(dict(EXAMPLE, revision=8)))[0], 503)
+        self.assertEqual(self.sensors["calendar_received_at"].native_value, first_received)
+        self.hass.store.fail = False
+        self.assertEqual((await self.post(dict(EXAMPLE, revision=8, occurrences=[])))[0], 200)
+        received = self.now
+        self.assertEqual(self.sensors["calendar_received_at"].latest_state[1], received)
+        self.assertEqual(self.sensors["upcoming_alarms"].latest_state[1], 0)
+        self.assertEqual(await self.events(), [])
+        await async_unload_entry(self.hass, self.entry)
+        self.now = datetime.fromisoformat(EXAMPLE["expires_at"])
+        await self.start_receiver()
+        self.assertEqual(self.sensors["calendar_received_at"].native_value, received)
+        self.assertEqual(self.sensors["calendar_freshness"].native_value, "expired")
+
+    async def test_sensors_use_utc_and_handle_nanoseconds_and_optional_target(self):
+        source = EXAMPLE["occurrences"][0]
+        row = {**source, "sound_start": "2027-03-28T01:45:00.000000001+00:00"}
+        del row["target_at"]
+        snapshot = dict(EXAMPLE, occurrences=[row])
+        del snapshot["alarms"]
+        self.now = datetime.fromisoformat("2027-03-28T01:45:00Z")
+        await self.post(snapshot)
+        alarm = self.sensors["next_alarm"]
+        self.assertEqual(alarm.native_value.tzinfo, UTC)
+        self.assertEqual(dt_api.as_local(alarm.native_value).hour, 3)
+        self.assertEqual(alarm.extra_state_attributes["name"], "Réveil Horéveil")
+        self.assertNotIn("target_at", alarm.extra_state_attributes)
+        self.assertEqual(self.sensors["upcoming_alarms"].native_value, 1)
+        self.advance_to(self.now + timedelta(microseconds=1))
+        self.assertIsNone(alarm.native_value)
+        self.assertEqual(self.sensors["upcoming_alarms"].native_value, 0)

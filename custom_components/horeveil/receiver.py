@@ -28,6 +28,7 @@ class SnapshotReceiver:
         self._token = token
         self._lock = asyncio.Lock()
         self._last: Snapshot | None = None
+        self.received_at: datetime | None = None
         self._closed = False
         self._storage_uncertain = False
 
@@ -50,6 +51,14 @@ class SnapshotReceiver:
             self._last = await self._hass.async_add_executor_job(
                 decode_snapshot, stored["snapshot"].encode("utf-8")
             )
+            if isinstance(value := stored.get("received_at"), str):
+                try:
+                    received_at = datetime.fromisoformat(value)
+                except ValueError:
+                    pass
+                else:
+                    if received_at.tzinfo is not None:
+                        self.received_at = received_at.astimezone(UTC)
 
     async def async_close(self) -> None:
         """Prevent new writes and wait for an existing commit to finish."""
@@ -72,9 +81,10 @@ class SnapshotReceiver:
                         return _reply(HTTPStatus.OK, "duplicate")
                     return _reply(HTTPStatus.CONFLICT, "revision_conflict")
 
+            received_at = datetime.now(UTC)
             stored = {
                 "snapshot": snapshot.raw,
-                "received_at": datetime.now(UTC).isoformat(),
+                "received_at": received_at.isoformat(),
             }
             try:
                 await self._store.async_save(stored)
@@ -91,6 +101,7 @@ class SnapshotReceiver:
                 self._storage_uncertain = previous != expected
                 return _reply(HTTPStatus.SERVICE_UNAVAILABLE, "storage_unavailable")
             self._last = snapshot
+            self.received_at = received_at
             async_dispatcher_send(self._hass, self.update_signal)
             return _reply(HTTPStatus.OK, "accepted")
 

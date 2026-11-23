@@ -31,10 +31,17 @@ class CalendarOccurrence:
     """Effective occurrence and its display metadata from the snapshot."""
 
     occurrence_id: str
-    sound_start: datetime
+    sound_start_instant: Instant
     name: str
     category: str
     mode: str
+    target_at: str | None
+
+    @property
+    def sound_start(self) -> datetime:
+        """Return the start at Home Assistant's datetime precision."""
+        seconds, nanos = self.sound_start_instant
+        return seconds.replace(microsecond=nanos // 1000)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,10 +69,11 @@ class Snapshot:
             metadata = catalog.get(occurrence["alarm_id"], {})
             yield CalendarOccurrence(
                 occurrence["occurrence_id"],
-                datetime.fromisoformat(occurrence["sound_start"]),
+                _instant(occurrence["sound_start"]),
                 metadata.get("name", ""),
                 metadata.get("category", ""),
                 metadata.get("mode", ""),
+                occurrence.get("target_at"),
             )
 
 

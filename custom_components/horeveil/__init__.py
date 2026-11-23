@@ -12,7 +12,7 @@ from .receiver import SnapshotReceiver
 
 type HoreveilConfigEntry = ConfigEntry[SnapshotReceiver]
 
-PLATFORMS = (Platform.CALENDAR,)
+PLATFORMS = (Platform.CALENDAR, Platform.SENSOR)
 
 
 def _store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
