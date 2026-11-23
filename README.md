@@ -4,6 +4,8 @@ L’étape 3C.1 reçoit les instantanés `calendar_snapshot` v1 de l’applicati
 
 Version de l’intégration **0.1.1**. Home Assistant **2026.10 ou ultérieur**. La première publication est distribuée via la branche `main` du dépôt personnalisé.
 
+Ce dépôt est distribué sous [licence MIT](LICENSE).
+
 <!-- ha-marketplace:exclude-start -->
 ## Installation
 

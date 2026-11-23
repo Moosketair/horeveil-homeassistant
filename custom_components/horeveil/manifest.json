@@ -1,6 +1,7 @@
 {
   "domain": "horeveil",
   "name": "Horéveil",
+  "categories": ["productivity_information.calendars_todos"],
   "codeowners": ["@moosketair"],
   "config_flow": true,
   "dependencies": ["webhook"],
