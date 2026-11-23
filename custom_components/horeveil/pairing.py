@@ -1,16 +1,18 @@
 """Internal invitation and association storage for direct pairing."""
 
 import asyncio
+from base64 import urlsafe_b64encode
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
-from hmac import compare_digest
+from hmac import compare_digest, digest as hmac_digest
 from ipaddress import ip_address
 import re
 from secrets import token_bytes
 from time import monotonic
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -19,16 +21,38 @@ from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN
 
+if TYPE_CHECKING:
+    from homeassistant.auth.models import User
+
 _TTL = timedelta(minutes=5)
 _MAX_INVITATIONS = 8
 _REGISTRY_KEY = f"{DOMAIN}.pairing_registry"
 _ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _CODE = re.compile(rf"[0-7][{_ALPHABET}]{{25}}", re.ASCII)
+_COMPARISON_CODE = re.compile(rf"[{_ALPHABET}]{{8}}", re.ASCII)
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
 
 class PairingError(ValueError):
     """A rejected pairing operation, without private context."""
+
+
+class InvalidPairingCredential(PairingError):
+    """An absent, expired or incorrect credential."""
+
+
+class PairingConflict(PairingError):
+    """The invitation or installation already has an incompatible claim."""
+
+
+class PairingApprovalRequired(PairingError):
+    """The authenticated claim is awaiting administrator approval."""
+
+
+class PairingStatus(StrEnum):
+    AWAITING_APPROVAL = "awaiting_approval"
+    APPROVED = "approved"
+    ACTIVE = "active"
 
 
 class AssociationState(StrEnum):
@@ -122,11 +146,45 @@ class Invitation:
 
 
 @dataclass(frozen=True, slots=True)
+class PairingClaim:
+    claim_id: UUID
+    installation_id: UUID
+    phone_label: str = field(repr=False)
+    credential_digest: bytes = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PairingReservation:
+    pairing_id: UUID
+    server_id: UUID
+    challenge: str
+    claim: PairingClaim
+    status: PairingStatus = PairingStatus.AWAITING_APPROVAL
+
+    def comparison_code(self) -> str:
+        message = (
+            f"horeveil-pair-v1|{self.server_id}|{self.pairing_id}|"
+            f"{self.claim.claim_id}|{self.challenge}"
+        )
+        output = hmac_digest(self.claim.credential_digest, message.encode("ascii"), "sha256")
+        return _crockford(output[:5], 8)
+
+
+@dataclass(frozen=True, slots=True)
+class PairingReview:
+    pairing_id: UUID
+    origin: str
+    phone_label: str = field(repr=False)
+    comparison_code: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class _PendingInvitation:
     administrator_id: str
     origin: str
     deadline: float
     digest: bytes = field(repr=False)
+    reservation: PairingReservation | None = None
 
 
 def validate_origin(candidate: str) -> str:
@@ -158,9 +216,15 @@ def validate_origin(candidate: str) -> str:
         raise PairingError("Expected a valid HTTPS origin") from None
 
 
-def _new_code() -> str:
-    value = int.from_bytes(token_bytes(16), "big")
-    return "".join(_ALPHABET[(value >> shift) & 31] for shift in range(125, -1, -5))
+def _crockford(data: bytes, width: int) -> str:
+    value = int.from_bytes(data, "big")
+    return "".join(_ALPHABET[(value >> shift) & 31] for shift in range((width - 1) * 5, -1, -5))
+
+
+def _invitation_digest(code: str) -> bytes:
+    if not isinstance(code, str) or not _CODE.fullmatch(code):
+        raise InvalidPairingCredential("Invalid invitation")
+    return sha256(code.encode("ascii")).digest()
 
 
 class _BackupExcludedStore(Store):
@@ -289,7 +353,7 @@ class PairingRegistry:
             ):
                 raise PairingError("Invitation limit reached")
             invitation_id = uuid4()
-            code = _new_code()
+            code = _crockford(token_bytes(16), 26)
             self._invitations[invitation_id] = _PendingInvitation(
                 administrator_id, origin, now + _TTL.total_seconds(), sha256(code.encode()).digest(),
             )
@@ -305,52 +369,177 @@ class PairingRegistry:
             del self._invitations[invitation_id]
             return True
 
+    async def async_claim(self, code: str, claim: PairingClaim) -> PairingReservation:
+        """Reserve an invitation or return the same reservation on an exact retry."""
+        digest = _invitation_digest(code)
+        if len(claim.credential_digest) != 32:
+            raise InvalidPairingCredential("Invalid credential digest")
+        async with self._lock:
+            server_id = self.server_id
+            self._prune_expired(self._clock())
+            for invitation_id, pending in self._invitations.items():
+                if not compare_digest(pending.digest, digest):
+                    continue
+                reservation = pending.reservation
+                if reservation is not None:
+                    if reservation.claim == claim and compare_digest(
+                        reservation.claim.credential_digest, claim.credential_digest,
+                    ):
+                        return reservation
+                    raise PairingConflict("Invitation already reserved")
+                if self._installation_active(claim.installation_id) or self._installation_reserved(
+                    claim.installation_id,
+                ):
+                    raise PairingConflict("Installation already paired or reserved")
+                reservation = PairingReservation(
+                    uuid4(), server_id, urlsafe_b64encode(token_bytes(32)).decode().rstrip("="), claim,
+                )
+                self._invitations[invitation_id] = replace(pending, reservation=reservation)
+                return reservation
+            raise InvalidPairingCredential("Invalid invitation")
+
+    def _find_reservation(
+        self, pairing_id: UUID,
+    ) -> tuple[UUID, _PendingInvitation, PairingReservation]:
+        _ = self.server_id
+        self._prune_expired(self._clock())
+        for invitation_id, pending in self._invitations.items():
+            if (reservation := pending.reservation) is not None and reservation.pairing_id == pairing_id:
+                return invitation_id, pending, reservation
+        raise InvalidPairingCredential("Pairing claim unavailable")
+
+    @staticmethod
+    def _administrator_id(user: "User | None") -> str:
+        if user is None or not user.is_active or not user.is_admin:
+            raise PermissionError("Administrator authentication required")
+        return user.id
+
+    async def async_review_claim(
+        self, user: "User | None", invitation_id: UUID,
+    ) -> PairingReview | None:
+        """Provide the comparison material to the authenticated invitation owner."""
+        async with self._lock:
+            administrator_id = self._administrator_id(user)
+            _ = self.server_id
+            self._prune_expired(self._clock())
+            pending = self._invitations.get(invitation_id)
+            if pending is None or pending.administrator_id != administrator_id:
+                raise InvalidPairingCredential("Invitation unavailable")
+            reservation = pending.reservation
+            if reservation is None:
+                return None
+            return PairingReview(
+                reservation.pairing_id, pending.origin,
+                reservation.claim.phone_label, reservation.comparison_code(),
+            )
+
+    async def async_approve_claim(
+        self, user: "User | None", pairing_id: UUID, comparison_code: str,
+    ) -> None:
+        """Record the explicit decision of the authenticated administrator."""
+        async with self._lock:
+            administrator_id = self._administrator_id(user)
+            invitation_id, pending, reservation = self._find_reservation(pairing_id)
+            if pending.administrator_id != administrator_id:
+                raise PermissionError("Invitation owner required")
+            if not _COMPARISON_CODE.fullmatch(comparison_code) or not compare_digest(
+                reservation.comparison_code(), comparison_code,
+            ):
+                raise InvalidPairingCredential("Comparison code mismatch")
+            self._invitations[invitation_id] = replace(
+                pending, reservation=replace(reservation, status=PairingStatus.APPROVED),
+            )
+
+    async def async_check_pairing(
+        self, pairing_id: UUID, secret: bytes, *, confirm: bool = False,
+    ) -> PairingStatus:
+        """Authenticate a status request or explicitly finalize an approved claim."""
+        if len(secret) != 32:
+            raise InvalidPairingCredential("Invalid pairing credential")
+        digest = sha256(secret).digest()
+        async with self._lock:
+            _ = self.server_id
+            if self._active_with_digest(pairing_id, digest) is not None:
+                return PairingStatus.ACTIVE
+            invitation_id, pending, reservation = self._find_reservation(pairing_id)
+            if not compare_digest(reservation.claim.credential_digest, digest):
+                raise InvalidPairingCredential("Invalid pairing credential")
+            if not confirm:
+                return reservation.status
+            if reservation.status is not PairingStatus.APPROVED:
+                raise PairingApprovalRequired("Administrator approval required")
+            await self._activate(
+                invitation_id, pending, pairing_id, reservation.claim.installation_id, digest,
+            )
+            return PairingStatus.ACTIVE
+
     async def async_activate_confirmed(
         self, invitation_id: UUID, code: str, *, installation_id: UUID,
         credential_digest: bytes, administrator_id: str,
     ) -> Association:
         """Consume an invitation after the caller has confirmed both sides."""
+        digest = _invitation_digest(code)
         if (
-            not isinstance(code, str) or not _CODE.fullmatch(code)
-            or not isinstance(installation_id, UUID)
-            or not isinstance(credential_digest, bytes) or len(credential_digest) != 32
+            not isinstance(installation_id, UUID) or not isinstance(credential_digest, bytes)
+            or len(credential_digest) != 32
         ):
             raise PairingError("Invalid pairing credential")
         async with self._lock:
-            server_id = self.server_id
+            _ = self.server_id
             self._prune_expired(self._clock())
             pending = self._invitations.get(invitation_id)
             if (
                 pending is None or pending.administrator_id != administrator_id
-                or not compare_digest(pending.digest, sha256(code.encode()).digest())
+                or pending.reservation is not None or not compare_digest(pending.digest, digest)
             ):
                 raise PairingError("Invalid invitation")
-            if any(
-                association.installation_id == installation_id
-                and association.state is AssociationState.ACTIVE
-                for association in self._associations.values()
-            ):
-                raise PairingError("Installation already paired")
-            pairing_id = uuid4()
-            association = Association(
-                pairing_id, installation_id, pending.origin, AssociationState.ACTIVE,
-                credential_digest=credential_digest,
+            if self._installation_reserved(installation_id):
+                raise PairingConflict("Installation already reserved")
+            return await self._activate(
+                invitation_id, pending, uuid4(), installation_id, credential_digest,
             )
-            del self._invitations[invitation_id]
-            await self._commit(server_id, {**self._associations, pairing_id: association})
+
+    def _installation_active(self, installation_id: UUID) -> bool:
+        return any(
+            association.installation_id == installation_id and association.state is AssociationState.ACTIVE
+            for association in self._associations.values()
+        )
+
+    def _installation_reserved(self, installation_id: UUID) -> bool:
+        return any(
+            pending.reservation is not None and pending.reservation.claim.installation_id == installation_id
+            for pending in self._invitations.values()
+        )
+
+    async def _activate(
+        self, invitation_id: UUID, pending: _PendingInvitation, pairing_id: UUID,
+        installation_id: UUID, credential_digest: bytes,
+    ) -> Association:
+        if self._installation_active(installation_id):
+            raise PairingConflict("Installation already paired")
+        server_id = self.server_id
+        association = Association(
+            pairing_id, installation_id, pending.origin, AssociationState.ACTIVE,
+            credential_digest=credential_digest,
+        )
+        del self._invitations[invitation_id]
+        await self._commit(server_id, {**self._associations, pairing_id: association})
+        return association
+
+    def _active_with_digest(self, pairing_id: UUID, digest: bytes) -> Association | None:
+        association = self._associations.get(pairing_id) if self._available else None
+        if (
+            association is not None and association.state is AssociationState.ACTIVE
+            and association.credential_digest is not None
+            and compare_digest(association.credential_digest, digest)
+        ):
             return association
+        return None
 
     async def async_authenticate(self, pairing_id: UUID, secret: bytes) -> Association | None:
         """Check proof of possession for exactly one active association."""
         async with self._lock:
-            association = self._associations.get(pairing_id) if self._available else None
-            if (
-                association is not None and association.state is AssociationState.ACTIVE
-                and association.credential_digest is not None and len(secret) == 32
-                and compare_digest(association.credential_digest, sha256(secret).digest())
-            ):
-                return association
-            return None
+            return self._active_with_digest(pairing_id, sha256(secret).digest()) if len(secret) == 32 else None
 
     async def async_revoke(self, pairing_id: UUID) -> bool:
         """Persist an irreversible tombstone for one association."""

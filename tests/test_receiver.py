@@ -201,7 +201,7 @@ with patch.dict(
             "homeassistant.core", HomeAssistant=object, callback=lambda function: function
         ),
         "homeassistant.exceptions": fake_module(
-            "homeassistant.exceptions", ConfigEntryError=RuntimeError
+            "homeassistant.exceptions", ConfigEntryError=RuntimeError, HomeAssistantError=RuntimeError
         ),
         "homeassistant.helpers": fake_module("homeassistant.helpers"),
         "homeassistant.helpers.dispatcher": fake_module(
@@ -223,6 +223,7 @@ with patch.dict(
     from custom_components.horeveil.config_flow import HoreveilConfigFlow
     from custom_components.horeveil.const import RELAY_HEADER, RELAY_TOKEN, WEBHOOK_ID
     from custom_components.horeveil import pairing as pairing_module
+    from custom_components.horeveil import pairing_http as pairing_http_module
     from custom_components.horeveil import receiver as receiver_module
     from custom_components.horeveil.sensor import async_setup_entry as setup_sensors
     from custom_components.horeveil.snapshot import MAX_BYTES
