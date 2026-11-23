@@ -1,0 +1,10 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add a Horéveil receiver",
+        "description": "Copy the path and token for your local Node-RED relay, then submit. Each receiver is bound to the first Horéveil installation that sends it a valid snapshot.\n\nWebhook path: `{path}`\n\n`X-Horeveil-Token` header: `{token}`"
+      }
+    }
+  }
+}

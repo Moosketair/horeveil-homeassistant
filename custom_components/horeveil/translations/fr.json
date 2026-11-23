@@ -1,0 +1,10 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Ajouter un récepteur Horéveil",
+        "description": "Copiez le chemin et le jeton pour configurer votre relais Node-RED local, puis validez. Chaque récepteur est associé à la première installation Horéveil qui lui envoie un instantané valide.\n\nChemin du webhook : `{path}`\n\nEn-tête `X-Horeveil-Token` : `{token}`"
+      }
+    }
+  }
+}
