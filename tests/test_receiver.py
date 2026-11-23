@@ -23,18 +23,24 @@ class DiskStore:
     """Model the public Store methods with independent reads after a restart."""
 
     def __init__(self, hass, version, key, **options):
-        self.path = hass.directory / key
+        self.hass = hass
+        self.key = key
         self.version = version
         self.options = options
         self.writes = 0
         self.fail = False
         hass.store = self
 
+    @property
+    def path(self):
+        return self.hass.directory / self.key
+
     async def async_load(self):
         return json.loads(self.path.read_text("utf-8")) if self.path.exists() else None
 
     async def async_save(self, state):
         if not self.fail:
+            self.path.parent.mkdir(exist_ok=True)
             self.path.write_text(json.dumps(state), encoding="utf-8")
             self.writes += 1
 
@@ -216,6 +222,7 @@ with patch.dict(
     from custom_components.horeveil.calendar import async_setup_entry as setup_calendar
     from custom_components.horeveil.config_flow import HoreveilConfigFlow
     from custom_components.horeveil.const import RELAY_HEADER, RELAY_TOKEN, WEBHOOK_ID
+    from custom_components.horeveil import pairing as pairing_module
     from custom_components.horeveil import receiver as receiver_module
     from custom_components.horeveil.sensor import async_setup_entry as setup_sensors
     from custom_components.horeveil.snapshot import MAX_BYTES
