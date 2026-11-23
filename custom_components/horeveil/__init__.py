@@ -2,6 +2,7 @@
 
 from homeassistant.components import webhook
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers.storage import Store
@@ -10,6 +11,8 @@ from .const import DOMAIN, RELAY_TOKEN, WEBHOOK_ID
 from .receiver import SnapshotReceiver
 
 type HoreveilConfigEntry = ConfigEntry[SnapshotReceiver]
+
+PLATFORMS = (Platform.CALENDAR,)
 
 
 def _store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
@@ -22,7 +25,9 @@ def _store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
 async def async_setup_entry(hass: HomeAssistant, entry: HoreveilConfigEntry) -> bool:
     """Restore the receiver before accepting requests."""
     try:
-        receiver = SnapshotReceiver(hass, _store(hass, entry), entry.data[RELAY_TOKEN])
+        receiver = SnapshotReceiver(
+            hass, _store(hass, entry), entry.data[RELAY_TOKEN], entry.entry_id
+        )
         await receiver.async_restore()
         webhook.async_register(
             hass, DOMAIN, "Horéveil", entry.data[WEBHOOK_ID], receiver.async_handle,
@@ -31,11 +36,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: HoreveilConfigEntry) -> 
     except Exception:
         raise ConfigEntryError("Unable to initialize the Horéveil receiver") from None
     entry.runtime_data = receiver
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except BaseException:
+        webhook.async_unregister(hass, entry.data[WEBHOOK_ID])
+        await receiver.async_close()
+        raise
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: HoreveilConfigEntry) -> bool:
     """Stop accepting requests on the entry."""
+    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        return False
     webhook.async_unregister(hass, entry.data[WEBHOOK_ID])
     await entry.runtime_data.async_close()
     return True

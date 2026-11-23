@@ -7,9 +7,10 @@ from secrets import compare_digest
 
 from aiohttp import web
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 
-from .const import RELAY_HEADER
+from .const import DOMAIN, RELAY_HEADER
 from .snapshot import MAX_BYTES, Snapshot, decode_snapshot
 
 
@@ -20,7 +21,8 @@ def _reply(status: HTTPStatus, result: str) -> web.Response:
 class SnapshotReceiver:
     """Coordinate a single phone and its durable revision watermark."""
 
-    def __init__(self, hass: HomeAssistant, store: Store, token: str) -> None:
+    def __init__(self, hass: HomeAssistant, store: Store, token: str, entry_id: str) -> None:
+        self.update_signal = f"{DOMAIN}_snapshot_updated_{entry_id}"
         self._hass = hass
         self._store = store
         self._token = token
@@ -89,6 +91,7 @@ class SnapshotReceiver:
                 self._storage_uncertain = previous != expected
                 return _reply(HTTPStatus.SERVICE_UNAVAILABLE, "storage_unavailable")
             self._last = snapshot
+            async_dispatcher_send(self._hass, self.update_signal)
             return _reply(HTTPStatus.OK, "accepted")
 
     async def async_handle(self, _hass, _webhook_id, request: web.Request) -> web.Response:

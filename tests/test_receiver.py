@@ -2,7 +2,8 @@
 
 import asyncio
 from copy import deepcopy
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 import gzip
 from io import BytesIO
 import json
@@ -12,6 +13,7 @@ from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -51,6 +53,74 @@ class ConfigFlow:
         return {"type": "form", **kwargs}
 
 
+@dataclass
+class CalendarEvent:
+    start: datetime
+    end: datetime
+    summary: str
+    description: str | None
+    uid: str
+
+    def __post_init__(self):
+        # Core validates duration after converting to Home Assistant's local timezone.
+        if dt_api.as_local(self.end) < dt_api.as_local(self.start):
+            raise ValueError("Negative local event duration")
+
+
+class CalendarEntity:
+    async def async_added_to_hass(self):
+        self.remove_callbacks = []
+        self.writes = 0
+
+    def async_on_remove(self, callback):
+        self.remove_callbacks.append(callback)
+
+    def async_write_ha_state(self):
+        self.writes += 1
+        self.latest_state = (self.available, self.event)
+
+
+class ConfigEntries:
+    def __init__(self, hass):
+        self.hass = hass
+
+    async def async_forward_entry_setups(self, entry, platforms):
+        assert platforms == ("calendar",)
+        entities = []
+        await setup_calendar(self.hass, entry, entities.extend)
+        self.calendar = entities[0]
+        self.calendar.hass = self.hass
+        await self.calendar.async_added_to_hass()
+        self.calendar.async_write_ha_state()
+
+    async def async_unload_platforms(self, entry, platforms):
+        assert platforms == ("calendar",)
+        for callback in self.calendar.remove_callbacks:
+            callback()
+        return True
+
+
+def connect(hass, signal, callback):
+    hass.listeners[signal] = callback
+    return lambda: hass.listeners.pop(signal)
+
+
+def send(hass, signal):
+    if signal in hass.listeners:
+        hass.listeners[signal]()
+
+
+def track_time(hass, callback, point):
+    hass.timers[point] = callback
+    return lambda: hass.timers.pop(point)
+
+
+dt_api = SimpleNamespace(
+    utcnow=lambda: datetime.now(UTC),
+    as_local=lambda value: value.astimezone(ZoneInfo("Europe/Paris")),
+)
+
+
 def register(hass, domain, name, webhook_id, handler, **options):
     hass.hooks[webhook_id] = (handler, options)
 
@@ -81,15 +151,36 @@ with patch.dict(
         "homeassistant.config_entries": fake_module(
             "homeassistant.config_entries", ConfigEntry=SimpleNamespace, ConfigFlow=ConfigFlow
         ),
-        "homeassistant.core": fake_module("homeassistant.core", HomeAssistant=object),
+        "homeassistant.components.calendar": fake_module(
+            "homeassistant.components.calendar", CalendarEntity=CalendarEntity,
+            CalendarEvent=CalendarEvent,
+        ),
+        "homeassistant.const": fake_module(
+            "homeassistant.const", Platform=SimpleNamespace(CALENDAR="calendar")
+        ),
+        "homeassistant.core": fake_module(
+            "homeassistant.core", HomeAssistant=object, callback=lambda function: function
+        ),
         "homeassistant.exceptions": fake_module(
             "homeassistant.exceptions", ConfigEntryError=RuntimeError
         ),
         "homeassistant.helpers": fake_module("homeassistant.helpers"),
+        "homeassistant.helpers.dispatcher": fake_module(
+            "homeassistant.helpers.dispatcher", async_dispatcher_connect=connect,
+            async_dispatcher_send=send,
+        ),
+        "homeassistant.helpers.entity_platform": fake_module(
+            "homeassistant.helpers.entity_platform", AddConfigEntryEntitiesCallback=object
+        ),
+        "homeassistant.helpers.event": fake_module(
+            "homeassistant.helpers.event", async_track_point_in_utc_time=track_time
+        ),
         "homeassistant.helpers.storage": fake_module("homeassistant.helpers.storage", Store=DiskStore),
+        "homeassistant.util": fake_module("homeassistant.util", dt=dt_api),
     },
 ):
     from custom_components.horeveil import async_remove_entry, async_setup_entry, async_unload_entry
+    from custom_components.horeveil.calendar import async_setup_entry as setup_calendar
     from custom_components.horeveil.config_flow import HoreveilConfigFlow
     from custom_components.horeveil.const import RELAY_HEADER, RELAY_TOKEN, WEBHOOK_ID
     from custom_components.horeveil import receiver as receiver_module
@@ -102,6 +193,11 @@ EXAMPLE = json.loads(CONTRACT.read_text("utf-8").split("```json\n", 1)[1].split(
 
 class ReceiverTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.now = datetime.fromisoformat("2027-03-27T08:00:00Z")
+        self.enterContext(patch.object(receiver_module, "datetime")).now.side_effect = (
+            lambda _zone: self.now
+        )
+        self.enterContext(patch.object(dt_api, "utcnow", lambda: self.now))
         workspace = Path(__file__).resolve().parents[1]
         directory = self.enterContext(TemporaryDirectory(dir=workspace))
         self.directory = Path(directory)
@@ -121,10 +217,13 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
         self.hass = SimpleNamespace(
             directory=self.directory,
             hooks={},
+            listeners={},
+            timers={},
             is_stopping=False,
             async_add_executor_job=asyncio.to_thread,
             async_create_task=asyncio.create_task,
         )
+        self.hass.config_entries = ConfigEntries(self.hass)
         await async_setup_entry(self.hass, self.entry)
 
     async def dispatch(self, request):
@@ -309,3 +408,136 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[1], (200, {"result": "accepted"}))
         self.assertIn(results[0][0], (200, 409))
         self.assertEqual(json.loads((await self.hass.store.async_load())["snapshot"])["revision"], 8)
+
+    @property
+    def calendar(self):
+        return self.hass.config_entries.calendar
+
+    async def events(self, start="2027-03-27T08:00:00Z", end="2027-04-26T07:00:00Z"):
+        return await self.calendar.async_get_events(
+            self.hass, datetime.fromisoformat(start), datetime.fromisoformat(end)
+        )
+
+    async def test_calendar_shows_sorted_effective_occurrences_and_catalog_details(self):
+        first = EXAMPLE["occurrences"][0]
+        second = dict(
+            first, nominal_date="2027-03-29", sound_start="2027-03-29T05:00:00Z",
+            target_at="2027-03-29T05:05:00Z",
+            occurrence_id=f"{first['alarm_id']}/2027-03-29",
+        )
+        self.assertFalse(self.calendar.available)
+        self.assertEqual((await self.post(dict(EXAMPLE, occurrences=[second, first])))[0], 200)
+        events = await self.events()
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].summary, "Réveil du matin")
+        self.assertEqual(events[0].description, "Catégorie : Travail\nMode : Matin")
+        self.assertEqual(events[0].start, datetime.fromisoformat(first["sound_start"]))
+        self.assertEqual(events[0].end - events[0].start, timedelta(minutes=1))
+        self.assertEqual(events[0].start.astimezone(ZoneInfo("Europe/Paris")).hour, 3)
+        self.assertEqual(self.calendar.latest_state, (True, events[0]))
+        self.assertEqual(self.calendar._attr_supported_features, 0)
+        self.now = events[0].end
+        self.assertEqual(self.calendar.event, events[1])
+
+    async def test_calendar_fallback_with_missing_catalog_or_blank_name(self):
+        snapshot = deepcopy(EXAMPLE)
+        del snapshot["alarms"]
+        await self.post(snapshot)
+        self.assertEqual((await self.events())[0].summary, "Réveil Horéveil")
+        self.assertIsNone((await self.events())[0].description)
+        catalog = {EXAMPLE["occurrences"][0]["alarm_id"]: {"name": "  ", "mode": "Nuit"}}
+        await self.post(dict(snapshot, revision=8, alarms=catalog))
+        event, = await self.events()
+        self.assertEqual(event.summary, "Réveil Horéveil")
+        self.assertEqual(event.description, "Mode : Nuit")
+
+    async def test_calendar_period_uses_exclusive_boundaries_and_accepts_other_timezones(self):
+        await self.post()
+        self.assertEqual(await self.events(end="2027-03-28T03:45:00+02:00"), [])
+        self.assertEqual(await self.events(start="2027-03-28T03:46:00+02:00"), [])
+        self.assertEqual(len(await self.events(
+            start="2027-03-28T03:45:30+02:00", end="2027-03-28T03:46:00+02:00"
+        )), 1)
+        self.assertEqual(await self.events(
+            start="2027-03-28T03:45:30+02:00", end="2027-03-28T03:45:30+02:00"
+        ), [])
+
+    async def test_calendar_fall_back_preserves_instants_and_shortens_crossing_event(self):
+        source = EXAMPLE["occurrences"][0]
+        rows = [
+            dict(source, occurrence_id=f"{source['alarm_id']}/{day}", nominal_date=day,
+                 sound_start=start)
+            for day, start in (
+                ("2027-10-31", "2027-10-31T00:59:30Z"),
+                ("2027-11-01", "2027-10-31T01:59:30Z"),
+            )
+        ]
+        for row in rows:
+            del row["target_at"]
+        snapshot = dict(
+            EXAMPLE, window_start="2027-10-02T08:00:00Z", window_end_exclusive="2027-11-01T09:00:00Z",
+            generated_at="2027-10-02T08:00:00Z", expires_at="2027-10-31T08:00:00Z", occurrences=rows,
+        )
+        self.now = datetime.fromisoformat("2027-10-31T00:00:00Z")
+        self.assertEqual((await self.post(snapshot))[0], 200)
+        begin = datetime(2027, 10, 31, 2, 58, tzinfo=ZoneInfo("Europe/Paris"))
+        end = begin.replace(fold=1)
+        first, = await self.calendar.async_get_events(self.hass, begin, end)
+        self.assertEqual(first.start, datetime.fromisoformat(rows[0]["sound_start"]))
+        self.assertEqual(first.end, datetime.fromisoformat("2027-10-31T00:59:59.999999Z"))
+        events = await self.events("2027-10-31T00:00:00Z", "2027-10-31T03:00:00Z")
+        self.assertEqual(len(events), 2)
+        self.assertEqual([dt_api.as_local(event.start).fold for event in events], [0, 1])
+
+    async def test_calendar_new_revision_replaces_events_and_keeps_uid_after_move(self):
+        stale = dict(EXAMPLE, occurrences=[])
+        first = EXAMPLE["occurrences"][0]
+        deleted = dict(first, occurrence_id=f"{first['alarm_id']}/2027-03-29",
+                       nominal_date="2027-03-29", sound_start="2027-03-29T01:45:00Z",
+                       target_at="2027-03-29T01:50:00Z")
+        await self.post(dict(EXAMPLE, occurrences=[first, deleted]))
+        original, _ = await self.events()
+        previous_writes = self.calendar.writes
+        moved = dict(first, sound_start="2027-03-28T06:30:00Z", target_at="2027-03-28T06:35:00Z")
+        self.assertEqual((await self.post(dict(EXAMPLE, revision=8, occurrences=[moved])))[0], 200)
+        event, = await self.events()
+        self.assertEqual(event.uid, original.uid)
+        self.assertEqual(event.start, datetime.fromisoformat(moved["sound_start"]))
+        self.assertEqual(self.calendar.writes, previous_writes + 1)
+        self.assertEqual((await self.post(stale))[0], 409)
+        self.assertEqual((await self.events())[0].start, event.start)
+        self.assertEqual(self.calendar.writes, previous_writes + 1)
+
+    async def test_calendar_empty_snapshot_clears_previous_events_but_is_available(self):
+        await self.post()
+        await self.post(dict(EXAMPLE, revision=8, occurrences=[], alarms={}))
+        self.assertEqual(self.calendar.latest_state, (True, None))
+        self.assertEqual(await self.events(), [])
+
+    async def test_calendar_expires_at_deadline_without_new_webhook_and_recovers(self):
+        await self.post(dict(EXAMPLE, expires_at="2027-03-28T08:00:00.000000001Z"))
+        deadline, = self.hass.timers
+        self.assertEqual(deadline, datetime.fromisoformat("2027-03-28T08:00:00.000001Z"))
+        self.now = deadline
+        self.hass.timers.pop(deadline)(deadline)
+        self.assertEqual(self.calendar.latest_state, (False, None))
+        self.assertEqual(await self.events(), [])
+        await self.post(dict(EXAMPLE, revision=8, expires_at="2027-03-29T08:00:00Z"))
+        self.assertTrue(self.calendar.available)
+        self.assertEqual(len(await self.events()), 1)
+
+    async def test_calendar_restoration_reuses_entry_and_unload_removes_subscription(self):
+        await self.post()
+        uid = self.calendar._attr_unique_id
+        previous = self.hass
+        await async_unload_entry(previous, self.entry)
+        self.assertFalse(previous.timers)
+        self.assertFalse(previous.listeners)
+        await self.start_receiver()
+        self.assertEqual(self.calendar._attr_unique_id, uid)
+        self.assertEqual((await self.events())[0].summary, "Réveil du matin")
+        await async_unload_entry(self.hass, self.entry)
+        self.now = datetime.fromisoformat(EXAMPLE["expires_at"])
+        await self.start_receiver()
+        self.assertFalse(self.calendar.available)
+        self.assertEqual(await self.events(), [])

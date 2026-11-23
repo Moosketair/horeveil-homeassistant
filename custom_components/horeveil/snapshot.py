@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal, InvalidOperation
@@ -26,6 +27,17 @@ class InvalidSnapshot(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class CalendarOccurrence:
+    """Effective occurrence and its display metadata from the snapshot."""
+
+    occurrence_id: str
+    sound_start: datetime
+    name: str
+    category: str
+    mode: str
+
+
+@dataclass(frozen=True, slots=True)
 class Snapshot:
     """A validated snapshot retaining the unmodified UTF-8 JSON text."""
 
@@ -42,6 +54,19 @@ class Snapshot:
     def same_content(self, other: Snapshot) -> bool:
         """Compare the entire JSON, including extensions."""
         return self.raw == other.raw or _equal_json(self._content, other._content)
+
+    def iter_calendar_occurrences(self) -> Iterator[CalendarOccurrence]:
+        """Read already validated occurrences without changing the payload."""
+        catalog = self._content.get("alarms", {})
+        for occurrence in self._content["occurrences"]:
+            metadata = catalog.get(occurrence["alarm_id"], {})
+            yield CalendarOccurrence(
+                occurrence["occurrence_id"],
+                datetime.fromisoformat(occurrence["sound_start"]),
+                metadata.get("name", ""),
+                metadata.get("category", ""),
+                metadata.get("mode", ""),
+            )
 
 
 def _equal_json(left: Any, right: Any) -> bool:

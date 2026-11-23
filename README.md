@@ -1,8 +1,8 @@
 # Horéveil pour Home Assistant
 
-L’étape 3C.1 reçoit les instantanés `calendar_snapshot` v1 de l’application Android via un relais Node-RED local. Elle conserve le dernier instantané par récepteur et calcule sa fraîcheur. La création d’une entité calendrier est prévue à l’étape 3C.2.
+Horéveil reçoit les instantanés `calendar_snapshot` v1 de l’application Android via un relais Node-RED local. Chaque récepteur dispose d’un calendrier Home Assistant en lecture seule, alimenté par son dernier instantané valide.
 
-Version de l’intégration **0.1.1**. Home Assistant **2026.10 ou ultérieur**. La première publication est distribuée via la branche `main` du dépôt personnalisé.
+Version de ce code **0.2.0**. Home Assistant **2026.10 ou ultérieur**. Le dépôt personnalisé installe le code publié sur `main`. Pour essayer cette version depuis la branche locale, utilisez l’installation manuelle.
 
 Ce dépôt est distribué sous [licence MIT](LICENSE).
 
@@ -61,9 +61,22 @@ Home Assistant peut répondre avec un 200 vide pour un chemin inconnu ou un appe
 
 Le stockage natif `Store` garde le texte JSON d’origine et la date de réception séparément, avec écriture atomique. Les états internes sont `empty`, `fresh` et `expired`. Dès `expires_at`, le snapshot cesse d’être disponible comme donnée courante. Il reste sur disque pour conserver l’identité et la dernière révision, y compris après redémarrage. La suppression de l’entrée efface son snapshot. Pour changer d’installation ou remplacer un secret perdu, supprimez l’entrée, créez-en une nouvelle, puis demandez une synchronisation Android.
 
+## Calendrier Horéveil
+
+Dans le panneau **Calendrier**, sélectionnez **Horéveil**. Chaque occurrence commence à `sound_start` et suit le fuseau d’affichage de Home Assistant, passage à l’heure d’été et retour à l’heure d’hiver compris. Le créneau dure une minute à l’écran. S’il traverse un recul d’horloge, il est raccourci pour se terminer avant le changement d’heure. La durée affichée est indépendante de la durée réelle de la sonnerie.
+
+Le titre reprend le nom de l’alarme ou **Réveil Horéveil** si le nom ou le catalogue manque. La description indique la catégorie et le mode disponibles. Une révision acceptée remplace les événements précédents. Un report conserve l’identifiant de l’occurrence et déplace son créneau. Un snapshot frais sans occurrence donne un calendrier vide. À l’expiration, ou avant la première réception, le calendrier est indisponible et ne renvoie aucun événement.
+
+### Recette sur Home Assistant
+
+1. Installez manuellement la branche de recette par-dessus la version installée et redémarrez Home Assistant en conservant l’entrée Horéveil existante. Avec un snapshot encore frais, vérifiez que le calendrier est visible avant tout nouvel envoi.
+2. Depuis le Galaxy S25+, partagez deux réveils de recette et synchronisez. Dans **Calendrier**, vérifiez leurs heures de début et ouvrez leurs détails pour contrôler le nom, la catégorie et le mode. Pour une alarme avec crescendo anticipé, comparez l’heure au début sonore.
+3. Reportez une occurrence et retirez l’autre du partage. Après la réponse `accepted`, vérifiez que la vue ouverte affiche le report et que le créneau retiré a disparu. Retirez ensuite le dernier réveil partagé en gardant le partage du calendrier actif et vérifiez le calendrier vide.
+4. Sur une entrée de recette, envoyez un snapshot synthétique avec une date `expires_at` proche et suspendez les envois. Après cette échéance, vérifiez que le calendrier est indisponible et que l’action `calendar.get_events` ne renvoie rien pour la période testée. Vérifiez le même état après redémarrage, puis la récupération à la réception d’une révision fraîche.
+
 ## Tests Python ciblés
 
-Résultat local sous Python 3.13.14 et aiohttp 3.14.5 — 17 tests réussis, 0 échec, 0 erreur.
+Résultat local sous Python 3.13.14 et aiohttp 3.14.5 — 25 tests réussis, dont les 17 scénarios du récepteur.
 
 ```powershell
 python -m venv .venv
@@ -71,4 +84,4 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Les tests partent de l’exemple Android copié dans le contrat. Ils utilisent de vraies requêtes HTTP via aiohttp sur la boucle locale et un double de test pour les API Home Assistant, avec des écritures sur disque pour la restauration. Les signatures et comportements utilisés ont été vérifiés dans le code source de Home Assistant Core 2026.11.2. La recette sur une instance Home Assistant et un relais Node-RED réels reste à faire. Voir la [documentation du config flow](https://contributors.home-assistant.io/core/integrations/config-flow/) et le [code de Store](https://raw.githubusercontent.com/home-assistant/core/2026.11.2/homeassistant/helpers/storage.py).
+Les tests partent de l’exemple Android copié dans le contrat. Ils utilisent de vraies requêtes HTTP via aiohttp sur la boucle locale et un double de test pour les API Home Assistant, avec des écritures sur disque pour la restauration. La recette du calendrier sur Home Assistant reste à faire. Les validations officielles HACS et hassfest sont configurées dans GitHub Actions. Voir la [documentation CalendarEntity](https://contributors.home-assistant.io/core/entities/calendar/) et le [code de Store](https://raw.githubusercontent.com/home-assistant/core/2026.11.2/homeassistant/helpers/storage.py).
