@@ -2,12 +2,36 @@
 
 L’étape 3C.1 reçoit les instantanés `calendar_snapshot` v1 de l’application Android via un relais Node-RED local. Elle conserve le dernier instantané par récepteur et calcule sa fraîcheur. La création d’une entité calendrier est prévue à l’étape 3C.2.
 
-## Installation manuelle
+Version de l’intégration **0.1.1**. Home Assistant **2026.10 ou ultérieur**. La première publication est distribuée via la branche `main` du dépôt personnalisé.
 
-1. Copiez le dossier `custom_components/horeveil` dans le répertoire de configuration de Home Assistant, de façon à obtenir `<config>/custom_components/horeveil/manifest.json`.
-2. Redémarrez Home Assistant. Dans **Paramètres → Appareils et services → Ajouter une intégration**, recherchez **Horéveil**.
-3. Copiez le chemin du webhook et le jeton affichés dans la boîte de configuration, puis validez. Gardez ces deux valeurs dans votre gestionnaire de secrets. Chaque entrée est associée à la première installation Android dont le snapshot est accepté. Créez une entrée distincte par installation.
-4. Configurez le [relais Node-RED](docs/NODE_RED.md). Dans Android, utilisez **Synchroniser maintenant** sur la destination de recette. Vérifiez côté relais que Home Assistant répond avec `{"result":"accepted"}` ou `{"result":"duplicate"}`.
+<!-- ha-marketplace:exclude-start -->
+## Installation
+
+### Home Assistant 2026.11 et ultérieur · Marketplace
+
+1. Ouvrez **Paramètres → Marketplace**, puis **Ajouter à partir d’un lien**.
+2. Connectez votre compte GitHub si Home Assistant vous le demande, puis ajoutez [Moosketair/horeveil-homeassistant](https://github.com/Moosketair/horeveil-homeassistant). Sélectionnez **Intégration** si le type est demandé.
+3. Ouvrez **Horéveil** et sélectionnez **Installer**. Le téléchargement utilise le dernier commit de `main`. Redémarrez si Home Assistant le demande.
+
+Consultez la [documentation Marketplace](https://www.home-assistant.io/integrations/marketplace/#custom-repositories).
+
+### Home Assistant 2026.10 · HACS
+
+1. Dans **HACS → ⋮ → Dépôts personnalisés**, ajoutez [Moosketair/horeveil-homeassistant](https://github.com/Moosketair/horeveil-homeassistant) avec le type **Intégration**.
+2. Ouvrez **Horéveil**, sélectionnez **Télécharger** et choisissez `main` si un choix est affiché. Redémarrez Home Assistant.
+
+Consultez la [documentation HACS](https://hacs.netlify.app/docs/faq/custom_repositories/).
+
+### Installation manuelle
+
+Copiez `custom_components/horeveil` dans le répertoire de configuration de Home Assistant, de façon à obtenir `<config>/custom_components/horeveil/manifest.json`, puis redémarrez.
+<!-- ha-marketplace:exclude-end -->
+
+## Configuration
+
+1. Dans **Paramètres → Appareils et services → Ajouter une intégration**, recherchez **Horéveil**.
+2. Copiez le chemin du webhook et le jeton affichés dans la boîte de configuration, puis validez. Gardez ces deux valeurs dans votre gestionnaire de secrets. Chaque entrée est associée à la première installation Android dont le snapshot est accepté. Créez une entrée distincte par installation.
+3. Configurez le [relais Node-RED](docs/NODE_RED.md). Dans Android, utilisez **Synchroniser maintenant** sur la destination de recette. Vérifiez côté relais que Home Assistant répond avec `{"result":"accepted"}` ou `{"result":"duplicate"}`.
 
 Le webhook natif accepte les POST sur le réseau local. L’en-tête `X-Horeveil-Token` apporte une authentification indépendante du chemin secret. Gardez le trajet Node-RED → Home Assistant sur le LAN. Si un proxy public dessert Home Assistant, bloquez-y le chemin de ce récepteur et excluez ce chemin, les en-têtes et le corps des journaux.
 
