@@ -32,14 +32,14 @@ def docker(*args, check=True):
 
 
 @contextmanager
-def npm_container(profile):
+def npm_container():
     name = "horeveil-npm-" + token_hex(6)
     docker("network", "create", name)
     try:
         docker(
             "run", "-d", "--name", name, "--network", name,
             "-p", "127.0.0.1::81", "-p", "127.0.0.1::80", "-p", "127.0.0.1::443",
-            "--mount", f"type=bind,source={profile / 'proxy'},target=/data/nginx/custom",
+            "-e", "DISABLE_IPV6=true",
             _IMAGE,
         )
         ports = [int(docker("port", name, f"{port}/tcp").rsplit(":", 1)[1]) for port in (81, 80, 443)]
@@ -60,18 +60,27 @@ class TestDns(AbstractResolver):
         pass
 
 
-async def configure_proxy(client, profile, api_port, public, gateway, core_port):
+async def configure_proxy(client, profile, container, api_port, public, gateway, core_port):
     url = f"http://127.0.0.1:{api_port}/api"
-    for _ in range(100):
+    last_status = None
+    for _ in range(60):
         try:
             async with client.get(url + "/") as response:
-                if response.status == 200:
+                last_status = response.status
+                if response.status == 200 and response.content_type == "application/json":
                     break
         except ClientConnectionError:
             pass
         await asyncio.sleep(1)
     else:
-        raise RuntimeError("API NPM indisponible sur le port de recette")
+        # NPM has no account or Horéveil credential at this point.
+        state = docker("inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", container, check=False)
+        logs = subprocess.run(["docker", "logs", "--tail", "25", container], capture_output=True, text=True, timeout=10)
+        raise RuntimeError(f"API NPM indisponible (HTTP {last_status}, Docker {state})\n{logs.stdout}{logs.stderr}")
+
+    docker("exec", container, "mkdir", "-p", "/data/nginx/custom")
+    for name in ("horeveil-relay-secret.inc", "horeveil-upstream-ca.pem"):
+        docker("cp", str(profile / "proxy" / name), f"{container}:/data/nginx/custom/{name}")
 
     email, password = "recette@example.invalid", token_hex(24)
     await check_request(client, "POST", url + "/users", 201, json={
@@ -130,7 +139,7 @@ async def exercise(profile, secret, container, api_port, http_port, tls_port, ga
         guest = await _token(hass, "Utilisateur NPM", alternate, administrator=False)
         tls = ssl.create_default_context(cafile=profile / "ca.pem")
         async with ClientSession(connector=TCPConnector(ssl=tls, resolver=TestDns()), timeout=ClientTimeout(total=8)) as client:
-            await configure_proxy(client, profile, api_port, public, gateway, port)
+            await configure_proxy(client, profile, container, api_port, public, gateway, port)
             docker("exec", container, "nginx", "-t")
             registry = hass.data["horeveil.local_pairing_test"].registry
 
@@ -174,5 +183,5 @@ if __name__ == "__main__":
         include = proxy / "horeveil-relay-secret.inc"
         include.touch(mode=0o600)
         include.write_text(f"proxy_set_header X-Horeveil-Relay-Secret {secret};\n", encoding="ascii")
-        with npm_container(profile) as settings:
+        with npm_container() as settings:
             asyncio.run(exercise(profile, secret, *settings))
