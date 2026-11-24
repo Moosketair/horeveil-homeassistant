@@ -39,6 +39,7 @@ def npm_container():
         docker(
             "run", "-d", "--name", name, "--network", name,
             "-p", "127.0.0.1::81", "-p", "127.0.0.1::80", "-p", "127.0.0.1::443",
+            "-v", "/data", "-v", "/etc/letsencrypt",
             "-e", "DISABLE_IPV6=true",
             _IMAGE,
         )
@@ -63,16 +64,20 @@ class TestDns(AbstractResolver):
 async def configure_proxy(client, profile, container, api_port, public, gateway, core_port):
     url = f"http://127.0.0.1:{api_port}/api"
     last_status = None
-    for _ in range(60):
+    ready = False
+    for attempt in range(60):
         try:
             async with client.get(url + "/") as response:
                 last_status = response.status
                 if response.status == 200 and response.content_type == "application/json":
+                    ready = True
                     break
         except ClientConnectionError:
             pass
+        if attempt % 10 == 0 and docker("inspect", "--format", "{{.State.Running}}", container) != "true":
+            break
         await asyncio.sleep(1)
-    else:
+    if not ready:
         # NPM has no account or Horéveil credential at this point.
         state = docker("inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", container, check=False)
         logs = subprocess.run(["docker", "logs", "--tail", "25", container], capture_output=True, text=True, timeout=10)
