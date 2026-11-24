@@ -116,10 +116,24 @@ proxy_ssl_trusted_certificate /data/nginx/custom/horeveil-upstream-ca.pem;
         files.add_field("certificate", (profile / f"{pem}.pem").read_bytes(), filename="certificate.pem")
         files.add_field("certificate_key", (profile / f"{pem}.key").read_bytes(), filename="key.pem")
         await check_request(client, "POST", f"{certificate}/{entry['id']}/upload", 200, headers=headers, data=files)
-        await check_request(client, "POST", hosts, 201, headers=headers, json={
+        host = await check_request(client, "POST", hosts, 201, headers=headers, json={
             **common, "domain_names": [hostname], "advanced_config": config, "certificate_id": entry["id"],
             "allow_websocket_upgrade": hostname == _ADMIN,
         })
+        saved = await check_request(client, "GET", f"{hosts}/{host['id']}", 200, headers=headers)
+        if not saved.get("meta", {}).get("nginx_online"):
+            raise RuntimeError(f"Hôte NPM {hostname} hors ligne : {saved.get('meta', {}).get('nginx_err')}")
+
+
+async def wait_for_vhost(client, origin):
+    # NPM's reload signals the master; it does not wait for new workers to serve TLS.
+    for _ in range(25):
+        try:
+            async with client.get(origin + "/", allow_redirects=False):
+                return
+        except ClientConnectionError:
+            await asyncio.sleep(0.4)
+    raise RuntimeError(f"NPM ne sert pas le certificat attendu pour {origin}")
 
 
 async def exercise(profile, secret, container, api_port, http_port, tls_port, gateway, peer):
@@ -146,6 +160,8 @@ async def exercise(profile, secret, container, api_port, http_port, tls_port, ga
         async with ClientSession(connector=TCPConnector(ssl=tls, resolver=TestDns()), timeout=ClientTimeout(total=8)) as client:
             await configure_proxy(client, profile, container, api_port, public, gateway, port)
             docker("exec", container, "nginx", "-t")
+            await wait_for_vhost(client, public)
+            await wait_for_vhost(client, alternate)
             registry = hass.data["horeveil.local_pairing_test"].registry
 
             async def boundary(direct, dedicated):
