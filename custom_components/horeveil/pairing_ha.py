@@ -1,10 +1,11 @@
 """Native HA wiring for an explicitly enabled, isolated pairing test."""
 
-from base64 import urlsafe_b64encode
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from hashlib import sha256
 from hmac import compare_digest
 from ipaddress import IPv4Address
 import logging
+from pathlib import Path
 import re
 import ssl
 from uuid import UUID
@@ -14,10 +15,13 @@ from cryptography import x509
 from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.serialization import load_der_public_key
 from hass_nabucasa import remote
+import probatio
 
 from homeassistant.components import websocket_api
 from homeassistant.components.http import HomeAssistantView, current_request
+from homeassistant.components.panel_custom import async_register_panel
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
@@ -34,6 +38,9 @@ _OAEP = padding.OAEP(
     mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None,
 )
 _RUNTIME_KEY = "horeveil.local_pairing_test"
+_PANEL = "horeveil-association"
+_PANEL_MODULE = "/api/horeveil/pairing-panel.js"
+_PUBLIC_KEY = re.compile(r"[A-Za-z0-9_-]{392}", re.ASCII)
 
 
 def _supports_local_test(server) -> bool:
@@ -126,6 +133,19 @@ class _ActivateView(_PairView):
         return await self.test.http.activate(request)
 
 
+class _PanelModuleView(_PairView):
+    url = _PANEL_MODULE
+    name = "api:horeveil:pair:panel"
+
+    async def get(self, request: web.Request) -> web.StreamResponse:
+        if self.test.client_key(request) is None:
+            raise web.HTTPNotFound
+        return web.FileResponse(
+            Path(__file__).with_name("pairing_panel.js"),
+            headers={"Cache-Control": "no-store", "Content-Type": "text/javascript"},
+        )
+
+
 def _uuid(value: object) -> UUID:
     if not isinstance(value, str) or len(value) != 36:
         raise ValueError
@@ -136,8 +156,20 @@ def _uuid(value: object) -> UUID:
 
 
 def _seal(key: rsa.RSAPublicKey, value: str) -> str:
-    # Core can log entire WS frames. Only the pinned test client can decrypt this.
+    # Core can log entire WS frames. The recipient decrypts with its private key.
     return urlsafe_b64encode(key.encrypt(value.encode("ascii"), _OAEP)).decode("ascii").rstrip("=")
+
+
+def _recipient(value: object, client_key: rsa.RSAPublicKey) -> rsa.RSAPublicKey:
+    """Use the browser's ephemeral public key, or the original CLI certificate."""
+    if value is None:
+        return client_key
+    if not isinstance(value, str) or not _PUBLIC_KEY.fullmatch(value):
+        raise ValueError
+    key = load_der_public_key(urlsafe_b64decode(value))
+    if not isinstance(key, rsa.RSAPublicKey) or key.key_size != 2048 or key.public_numbers().e != 65537:
+        raise ValueError
+    return key
 
 
 class _AdminOperation:
@@ -161,7 +193,9 @@ class _AdminOperation:
         self.connection.send_error(self.msg_id, code, "Pairing operation unavailable")
 
 
-@websocket_api.websocket_command({"type": f"{_WS}/invite", "origin": str})
+@websocket_api.websocket_command({
+    "type": f"{_WS}/invite", "origin": str, probatio.Optional("display_key"): str,
+})
 @websocket_api.require_admin
 @websocket_api.async_response
 async def _invite(hass, connection, msg) -> None:
@@ -173,6 +207,7 @@ async def _invite(hass, connection, msg) -> None:
         if not isinstance(origin, str) or validate_origin(origin) != operation.test.origin:
             operation.error("invalid_origin")
             return
+        recipient = _recipient(msg.get("display_key"), operation.key)
         invitation = await operation.test.registry.async_invite(
             administrator_id=operation.user.id, confirmed_origin=operation.test.origin,
         )
@@ -180,13 +215,15 @@ async def _invite(hass, connection, msg) -> None:
             "invitation_id": str(invitation.invitation_id),
             "origin": invitation.origin,
             "expires_at": invitation.expires_at.isoformat(),
-            "code_encrypted": _seal(operation.key, invitation.code),
+            "code_encrypted": _seal(recipient, invitation.code),
         })
-    except (PairingError, ValueError):
+    except (UnsupportedAlgorithm, ValueError):
         operation.error("invitation_unavailable")
 
 
-@websocket_api.websocket_command({"type": f"{_WS}/status", "invitation_id": str})
+@websocket_api.websocket_command({
+    "type": f"{_WS}/status", "invitation_id": str, probatio.Optional("display_key"): str,
+})
 @websocket_api.require_admin
 @websocket_api.async_response
 async def _status(hass, connection, msg) -> None:
@@ -194,6 +231,7 @@ async def _status(hass, connection, msg) -> None:
     if operation.key is None:
         return
     try:
+        recipient = _recipient(msg.get("display_key"), operation.key)
         review = await operation.test.registry.async_review_claim(
             operation.user, _uuid(msg.get("invitation_id")),
         )
@@ -203,9 +241,9 @@ async def _status(hass, connection, msg) -> None:
             operation.result({
                 "state": review.status.value,
                 "pairing_id": str(review.pairing_id),
-                "comparison_code_encrypted": _seal(operation.key, review.comparison_code),
+                "comparison_code_encrypted": _seal(recipient, review.comparison_code),
             })
-    except (PairingError, ValueError):
+    except (UnsupportedAlgorithm, ValueError):
         operation.error("invitation_unavailable")
 
 
@@ -251,6 +289,50 @@ async def _cancel(hass, connection, msg) -> None:
         operation.error("invitation_unavailable")
 
 
+@websocket_api.websocket_command({"type": f"{_WS}/info"})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _info(hass, connection, msg) -> None:
+    operation = _AdminOperation(hass, connection, msg)
+    if operation.key is None:
+        return
+    configured_url = hass.config.external_url
+    try:
+        suggestion = validate_origin(configured_url) if configured_url else None
+    except PairingError:
+        suggestion = None
+    try:
+        active = await operation.test.registry.async_list_active()
+    except PairingError:
+        operation.error("registry_unavailable")
+        return
+    operation.result({
+        "suggested_origin": suggestion or operation.test.origin,
+        "test_origin": operation.test.origin,
+        "phones": [str(pairing_id) for pairing_id in active],
+    })
+
+
+@websocket_api.websocket_command({"type": f"{_WS}/revoke", "pairing_id": str, "confirmed": bool})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _revoke(hass, connection, msg) -> None:
+    operation = _AdminOperation(hass, connection, msg)
+    if operation.key is None:
+        return
+    try:
+        if msg.get("confirmed") is not True:
+            operation.error("confirmation_required")
+            return
+        revoked = await operation.test.registry.async_revoke(_uuid(msg.get("pairing_id")))
+        if revoked:
+            operation.result({"state": "revoked"})
+        else:
+            operation.error("phone_unavailable")
+    except (HomeAssistantError, OSError, ValueError):
+        operation.error("registry_unavailable")
+
+
 async def async_setup_local_pairing(hass: HomeAssistant, fingerprint: object) -> None:
     """Register only on an explicitly opted-in, isolated native HA HTTP server."""
     server = hass.http
@@ -272,7 +354,14 @@ async def async_setup_local_pairing(hass: HomeAssistant, fingerprint: object) ->
     test = _LocalPairingTest(registry, bytes.fromhex(fingerprint), server.server_port)
     for view in (_ClaimView, _StatusView, _ActivateView):
         server.register_view(view(test))
-    for command in (_invite, _status, _approve, _cancel):
+    for command in (_invite, _status, _approve, _cancel, _info, _revoke):
         websocket_api.async_register_command(hass, command)
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, test.stop)
     hass.data[_RUNTIME_KEY] = test
+    if "frontend" in hass.config.components:
+        server.register_view(_PanelModuleView(test))
+        await async_register_panel(
+            hass, frontend_url_path=_PANEL, webcomponent_name=_PANEL,
+            sidebar_title="Horéveil", sidebar_icon="mdi:alarm",
+            module_url=_PANEL_MODULE, require_admin=True,
+        )

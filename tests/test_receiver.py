@@ -193,6 +193,10 @@ def require_admin(handler):
     return enforce
 
 
+async def register_panel(hass, **options):
+    hass.panels[options["frontend_url_path"]] = options
+
+
 with patch.dict(
     "sys.modules",
     {
@@ -216,6 +220,9 @@ with patch.dict(
         ),
         "homeassistant.components.http": fake_module(
             "homeassistant.components.http", HomeAssistantView=object, current_request=current_request,
+        ),
+        "homeassistant.components.panel_custom": fake_module(
+            "homeassistant.components.panel_custom", async_register_panel=register_panel,
         ),
         "homeassistant.config_entries": fake_module(
             "homeassistant.config_entries", ConfigEntry=SimpleNamespace, ConfigFlow=ConfigFlow
@@ -255,6 +262,7 @@ with patch.dict(
         "hass_nabucasa": fake_module(
             "hass_nabucasa", remote=SimpleNamespace(is_cloud_request=is_cloud_request),
         ),
+        "probatio": fake_module("probatio", Optional=lambda name: name),
     },
 ):
     from custom_components.horeveil import async_remove_entry, async_setup_entry, async_unload_entry

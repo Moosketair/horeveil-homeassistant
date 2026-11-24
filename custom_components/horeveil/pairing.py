@@ -556,3 +556,12 @@ class PairingRegistry:
                 return False
             await self._commit(server_id, {**self._associations, pairing_id: association.revoked()})
             return True
+
+    async def async_list_active(self) -> tuple[UUID, ...]:
+        """Return active association identifiers without credentials or labels."""
+        async with self._lock:
+            _ = self.server_id
+            return tuple(
+                pairing_id for pairing_id, association in self._associations.items()
+                if association.state is AssociationState.ACTIVE
+            )

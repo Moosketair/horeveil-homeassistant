@@ -90,8 +90,9 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
             context = ssl.create_default_context(cafile=cafile)
             context.load_cert_chain(pem, keyfile)
             setattr(cls, f"{name}_tls", context)
+            setattr(cls, f"{name}_key", key)
             if name == "pinned":
-                cls.pinned_key, cls.fingerprint = key, fingerprint
+                cls.fingerprint = fingerprint
         cls.anonymous_tls = ssl.create_default_context(cafile=cafile)
 
     async def asyncSetUp(self):
@@ -120,8 +121,8 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         )
         return SimpleNamespace(
             http=http, directory=self.directory,
-            config=SimpleNamespace(path=self.directory.joinpath), data={},
-            ws_commands={}, views=views, listeners=listeners,
+            config=SimpleNamespace(path=self.directory.joinpath, components={"frontend"}, external_url=None),
+            data={}, ws_commands={}, views=views, listeners=listeners, panels={},
             bus=SimpleNamespace(async_listen_once=listeners.__setitem__),
         )
 
@@ -196,6 +197,7 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         await setup_domain(hass, {})
         self.assertEqual(hass.views, {})
         self.assertEqual(hass.ws_commands, {})
+        self.assertEqual(hass.panels, {})
         for field, value in (
             ("server_host", ["0.0.0.0"]), ("server_host", ["127.0.0.1", "::"]),
             ("ssl_peer_certificate", None), ("context", None),
@@ -208,6 +210,7 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
                     await setup_domain(hass, self.config())
                 self.assertEqual(hass.views, {})
                 self.assertEqual(hass.ws_commands, {})
+                self.assertEqual(hass.panels, {})
                 self.assertEqual(hass.data, {})
 
     async def test_real_tls_rejects_unpinned_clients_and_proxy_metadata(self):
@@ -297,3 +300,68 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         registry = restarted.data["horeveil.local_pairing_test"].registry
         self.assertEqual(registry.server_id, test.registry.server_id)
         self.assertFalse(registry._invitations)
+
+    async def test_admin_panel_and_address_suggestion_remain_local(self):
+        await self.start()
+        panel = self.hass.panels["horeveil-association"]
+        self.assertIs(panel["require_admin"], True)
+        self.hass.config.external_url = "https://ha.example/"
+        info = (await self.ws("info"))["result"]
+        self.assertEqual(info, {"suggested_origin": "https://ha.example", "test_origin": _ORIGIN, "phones": []})
+        self.assertEqual((await self.ws("invite", origin=info["suggested_origin"]))["error"], "invalid_origin")
+        self.hass.config.external_url = "https://private:user@ha.example"
+        self.assertEqual((await self.ws("info"))["result"]["suggested_origin"], _ORIGIN)
+        self.cloud = True
+        self.assertEqual((await self.ws("info"))["error"], "unauthorized")
+        asset_url = self.server.make_url(panel["module_url"])
+        self.assertEqual((await self.client.get(asset_url)).status, 404)
+        self.cloud = False
+        response = await self.client.get(asset_url)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertIn('customElements.define("horeveil-association"', await response.text())
+        self.user = SimpleNamespace(is_admin=False, is_active=True, id="other")
+        self.assertEqual((await self.ws("info"))["error"], "unauthorized")
+        self.assertEqual(
+            (await self.ws("revoke", pairing_id=str(uuid4()), confirmed=True))["error"], "unauthorized",
+        )
+
+    async def test_browser_key_and_admin_can_revoke_one_phone(self):
+        await self.start()
+        key = self.other_key
+        display_key = b64(key.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo,
+        ))
+        failure = await self.ws("invite", origin=_ORIGIN, display_key="invalid")
+        self.assertEqual(failure["error"], "invitation_unavailable")
+        invited = (await self.ws("invite", origin=_ORIGIN + "/", display_key=display_key))["result"]
+
+        def unseal(value):
+            return key.decrypt(
+                urlsafe_b64decode(value + "=" * (-len(value) % 4)),
+                padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
+            ).decode("ascii")
+
+        with self.assertRaises(ValueError):
+            self.unseal(invited["code_encrypted"])
+        reserved = await (await self.claim(unseal(invited["code_encrypted"]))).json()
+        invitation_id, pairing_id = invited["invitation_id"], reserved["pairing_id"]
+        status = (await self.ws("status", invitation_id=invitation_id, display_key=display_key))["result"]
+        self.assertEqual(
+            unseal(status["comparison_code_encrypted"]),
+            comparison_code(reserved, self.payload["claim_id"], self.secret),
+        )
+        approved = await self.ws("approve", invitation_id=invitation_id, pairing_id=pairing_id, confirmed=True)
+        self.assertEqual(approved["result"]["state"], "approved")
+        response = await self.client.post(
+            self.server.make_url(f"{_BASE}/activate"), headers=self.auth(pairing_id), json={"confirmed": True},
+        )
+        self.assertEqual((await response.json())["state"], "active")
+        self.assertEqual((await self.ws("info"))["result"]["phones"], [pairing_id])
+        declined = await self.ws("revoke", pairing_id=pairing_id, confirmed=False)
+        self.assertEqual(declined["error"], "confirmation_required")
+        result = await self.ws("revoke", pairing_id=pairing_id, confirmed=True)
+        self.assertEqual(result["result"]["state"], "revoked")
+        self.assertEqual((await self.ws("info"))["result"]["phones"], [])
+        response = await self.client.get(self.server.make_url(f"{_BASE}/status"), headers=self.auth(pairing_id))
+        self.assertEqual(response.status, 401)
