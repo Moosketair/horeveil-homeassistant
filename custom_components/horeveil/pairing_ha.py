@@ -26,6 +26,7 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
+from .const import DOMAIN
 from .pairing import InvalidPairingCredential, PairingError, PairingRegistry, validate_origin
 from .pairing_http import PairingHttp
 
@@ -363,5 +364,5 @@ async def async_setup_local_pairing(hass: HomeAssistant, fingerprint: object) ->
         await async_register_panel(
             hass, frontend_url_path=_PANEL, webcomponent_name=_PANEL,
             sidebar_title="Horéveil", sidebar_icon="mdi:alarm",
-            module_url=_PANEL_MODULE, require_admin=True,
+            module_url=_PANEL_MODULE, require_admin=True, config_panel_domain=DOMAIN,
         )

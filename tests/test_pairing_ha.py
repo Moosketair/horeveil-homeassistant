@@ -305,6 +305,7 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         await self.start()
         panel = self.hass.panels["horeveil-association"]
         self.assertIs(panel["require_admin"], True)
+        self.assertEqual(panel["config_panel_domain"], "horeveil")
         self.hass.config.external_url = "https://ha.example/"
         info = (await self.ws("info"))["result"]
         self.assertEqual(info, {"suggested_origin": "https://ha.example", "test_origin": _ORIGIN, "phones": []})
