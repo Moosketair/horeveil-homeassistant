@@ -2,6 +2,7 @@
 
 import asyncio
 from copy import deepcopy
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import gzip
@@ -17,6 +18,9 @@ from zoneinfo import ZoneInfo
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+# Keep these real modules loaded when patch.dict restores sys.modules.
+from cryptography import x509  # noqa: F401
+from cryptography.hazmat.primitives.asymmetric import padding, rsa  # noqa: F401
 
 
 class DiskStore:
@@ -169,6 +173,26 @@ def fake_module(name, **attributes):
     return module
 
 
+current_request = ContextVar("current_request", default=None)
+is_cloud_request = ContextVar("is_cloud_request", default=False)
+
+
+def websocket_command(schema):
+    def decorate(handler):
+        handler.command = schema["type"]
+        return handler
+    return decorate
+
+
+def require_admin(handler):
+    async def enforce(hass, connection, msg):
+        if connection.user is None or not connection.user.is_admin:
+            connection.send_error(msg["id"], "unauthorized", "Administrator required")
+            return
+        await handler(hass, connection, msg)
+    return enforce
+
+
 with patch.dict(
     "sys.modules",
     {
@@ -181,6 +205,17 @@ with patch.dict(
                 async_generate_id=lambda: token_hex(32),
                 async_generate_path=lambda key: f"/api/webhook/{key}",
             ),
+            websocket_api=SimpleNamespace(
+                websocket_command=websocket_command,
+                require_admin=require_admin,
+                async_response=lambda handler: handler,
+                async_register_command=lambda hass, handler: hass.ws_commands.update(
+                    {handler.command: handler},
+                ),
+            ),
+        ),
+        "homeassistant.components.http": fake_module(
+            "homeassistant.components.http", HomeAssistantView=object, current_request=current_request,
         ),
         "homeassistant.config_entries": fake_module(
             "homeassistant.config_entries", ConfigEntry=SimpleNamespace, ConfigFlow=ConfigFlow
@@ -195,7 +230,8 @@ with patch.dict(
             SensorDeviceClass=SimpleNamespace(TIMESTAMP="timestamp", ENUM="enum"),
         ),
         "homeassistant.const": fake_module(
-            "homeassistant.const", Platform=SimpleNamespace(CALENDAR="calendar", SENSOR="sensor")
+            "homeassistant.const", Platform=SimpleNamespace(CALENDAR="calendar", SENSOR="sensor"),
+            EVENT_HOMEASSISTANT_STOP="homeassistant_stop",
         ),
         "homeassistant.core": fake_module(
             "homeassistant.core", HomeAssistant=object, callback=lambda function: function
@@ -216,6 +252,9 @@ with patch.dict(
         ),
         "homeassistant.helpers.storage": fake_module("homeassistant.helpers.storage", Store=DiskStore),
         "homeassistant.util": fake_module("homeassistant.util", dt=dt_api),
+        "hass_nabucasa": fake_module(
+            "hass_nabucasa", remote=SimpleNamespace(is_cloud_request=is_cloud_request),
+        ),
     },
 ):
     from custom_components.horeveil import async_remove_entry, async_setup_entry, async_unload_entry
@@ -224,6 +263,8 @@ with patch.dict(
     from custom_components.horeveil.const import RELAY_HEADER, RELAY_TOKEN, WEBHOOK_ID
     from custom_components.horeveil import pairing as pairing_module
     from custom_components.horeveil import pairing_http as pairing_http_module
+    from custom_components.horeveil import pairing_ha as pairing_ha_module
+    from custom_components.horeveil import async_setup as setup_domain
     from custom_components.horeveil import receiver as receiver_module
     from custom_components.horeveil.sensor import async_setup_entry as setup_sensors
     from custom_components.horeveil.snapshot import MAX_BYTES

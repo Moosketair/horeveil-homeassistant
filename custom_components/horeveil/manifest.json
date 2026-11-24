@@ -4,7 +4,7 @@
   "categories": ["productivity_information.calendars_todos"],
   "codeowners": ["@moosketair"],
   "config_flow": true,
-  "dependencies": ["webhook"],
+  "dependencies": ["http", "webhook", "websocket_api"],
   "documentation": "https://github.com/Moosketair/horeveil-homeassistant#readme",
   "integration_type": "service",
   "iot_class": "local_push",

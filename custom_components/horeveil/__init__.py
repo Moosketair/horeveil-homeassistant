@@ -15,6 +15,16 @@ type HoreveilConfigEntry = ConfigEntry[SnapshotReceiver]
 PLATFORMS = (Platform.CALENDAR, Platform.SENSOR)
 
 
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Set up the optional isolated pairing test without affecting entries."""
+    options = config.get(DOMAIN)
+    if isinstance(options, dict) and "local_pairing_test_client_sha256" in options:
+        from .pairing_ha import async_setup_local_pairing
+
+        await async_setup_local_pairing(hass, options["local_pairing_test_client_sha256"])
+    return True
+
+
 def _store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
     return Store(
         hass, 1, f"{DOMAIN}.{entry.entry_id}", private=True,

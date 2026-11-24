@@ -174,6 +174,7 @@ class PairingReservation:
 class PairingReview:
     pairing_id: UUID
     origin: str
+    status: PairingStatus
     phone_label: str = field(repr=False)
     comparison_code: str = field(repr=False)
 
@@ -369,6 +370,11 @@ class PairingRegistry:
             del self._invitations[invitation_id]
             return True
 
+    async def async_discard_invitations(self) -> None:
+        """Clear all pending invitations when the local test shuts down."""
+        async with self._lock:
+            self._invitations.clear()
+
     async def async_claim(self, code: str, claim: PairingClaim) -> PairingReservation:
         """Reserve an invitation or return the same reservation on an exact retry."""
         digest = _invitation_digest(code)
@@ -429,7 +435,7 @@ class PairingRegistry:
             if reservation is None:
                 return None
             return PairingReview(
-                reservation.pairing_id, pending.origin,
+                reservation.pairing_id, pending.origin, reservation.status,
                 reservation.claim.phone_label, reservation.comparison_code(),
             )
 
