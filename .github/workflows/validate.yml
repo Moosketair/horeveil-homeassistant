@@ -40,3 +40,20 @@ jobs:
         with:
           persist-credentials: false
       - uses: home-assistant/actions/hassfest@9e9565e68f5a70d874202871f4c4064d23814235 # master
+
+  npm:
+    name: Appairage avec Nginx Proxy Manager
+    if: github.ref == 'refs/heads/feature/3c4b8-npm-validation' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+      - run: python -m pip install "homeassistant==2026.11.2" "home-assistant-frontend==20261028.6"
+      - run: python -u tests/real_pairing_npm.py
+      - run: python -u tests/real_upgrade_030.py

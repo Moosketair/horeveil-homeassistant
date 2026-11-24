@@ -9,6 +9,8 @@ from shutil import copytree
 import ssl
 import subprocess
 from tempfile import TemporaryDirectory
+from time import monotonic
+from unittest.mock import patch
 from uuid import uuid4
 
 from aiohttp import ClientConnectionError, ClientSession, TCPConnector, ThreadedResolver
@@ -33,7 +35,7 @@ async def check_request(client, method, url, expected, **kwargs):
         return await response.json() if response.content_type == "application/json" else None
 
 
-async def test_api(local, phone, origin, public, cleartext, alternate, admin, guest):
+async def test_api(local, phone, origin, public, cleartext, alternate, admin, guest, *, registry=None, boundary=None):
     status = _BASE + "/status"
     await check_request(phone, "GET", public + status, 404)
     async with local.ws_connect(alternate + "/api/websocket") as ws:
@@ -49,6 +51,8 @@ async def test_api(local, phone, origin, public, cleartext, alternate, admin, gu
         assert not (await _pair(ws, "direct_access", enabled=True, confirmed=True, origin=_SUGGESTED))["success"]
         assert not (await _pair(ws, "direct_access", enabled=True, confirmed=False, origin=public))["success"]
         assert (await _pair(ws, "direct_access", enabled=True, confirmed=True, origin=public))["success"]
+        if boundary is not None:
+            await boundary(origin, public)
         spoofed = {
             "X-Horeveil-Relay-Secret": token_hex(32), "X-Horeveil-Proxy-Origin": _SUGGESTED,
             "X-Forwarded-For": "172.18.0.1", "X-Forwarded-Proto": "http",
@@ -71,15 +75,23 @@ async def test_api(local, phone, origin, public, cleartext, alternate, admin, gu
         display_key = _b64(display.public_key().public_bytes(
             serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo,
         ))
-        assert not (await _pair(ws, "invite", origin=public))["success"]
-        invite = (await _pair(ws, "invite", origin=public, display_key=display_key))["result"]
-        temporary = _decode_code(invite["code_encrypted"], display)
         phone_secret = token_bytes(32)
         body = {
             "claim_id": str(uuid4()), "installation_id": str(uuid4()), "phone_label": "Recette native",
             "credential_digest": _b64(sha256(phone_secret).digest()),
         }
-        invitations = {"X-Horeveil-Invitation": temporary}
+        async def invite_phone():
+            return (await _pair(ws, "invite", origin=public, display_key=display_key))["result"]
+
+        assert not (await _pair(ws, "invite", origin=public))["success"]
+        if registry is not None:
+            expired = _decode_code((await invite_phone())["code_encrypted"], display)
+            with patch.object(registry, "_clock", lambda: monotonic() + 301):
+                await check_request(phone, "POST", public + _BASE + "/claim", 401, json=body,
+                                    headers={"X-Horeveil-Invitation": expired})
+
+        invite = await invite_phone()
+        invitations = {"X-Horeveil-Invitation": _decode_code(invite["code_encrypted"], display)}
         async def claim():
             return await check_request(phone, "POST", public + _BASE + "/claim", 200, json=body, headers=invitations)
 
@@ -91,6 +103,8 @@ async def test_api(local, phone, origin, public, cleartext, alternate, admin, gu
         await check_request(phone, "POST", activate, 403, json={"confirmed": True}, headers=auth)
         approval = {"invitation_id": invite["invitation_id"], "pairing_id": identifier, "confirmed": True}
         assert (await _pair(ws, "approve", **approval))["success"]
+        assert (await check_request(phone, "GET", public + status, 200, headers=auth))["state"] == "approved"
+        assert (await check_request(phone, "POST", activate, 200, json={"confirmed": True}, headers=auth))["state"] == "active"
         assert (await check_request(phone, "POST", activate, 200, json={"confirmed": True}, headers=auth))["state"] == "active"
         assert (await _pair(ws, "revoke", pairing_id=identifier, confirmed=True))["success"]
         await check_request(phone, "GET", public + status, 401, headers=auth)

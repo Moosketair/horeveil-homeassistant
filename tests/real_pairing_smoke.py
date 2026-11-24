@@ -41,7 +41,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 _PUBLIC_NAME = "pairing.example.invalid"
 
 
-def _certificate_files(profile, nginx):
+def _certificate_files(profile, nginx, alternate_name=None):
     now = datetime.now(UTC)
     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     issuer = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "CA Horéveil de recette")])
@@ -86,6 +86,8 @@ def _certificate_files(profile, nginx):
     if not nginx:
         return admin, None
     write("public", x509.ExtendedKeyUsageOID.SERVER_AUTH, _PUBLIC_NAME)
+    if alternate_name:
+        write("alternate", x509.ExtendedKeyUsageOID.SERVER_AUTH, alternate_name)
     return admin, write("proxy", x509.ExtendedKeyUsageOID.CLIENT_AUTH)
 
 

@@ -90,7 +90,7 @@ Les [événements de sonnerie et de commandes réelles](docs/EVENEMENTS_TEMPS_RE
 
 ## Appairage direct de recette
 
-Le [guide Supervised et Nginx Proxy Manager](docs/APPAIRAGE_DIRECT_3C4B7.md) décrit le mode natif optionnel et les vérifications avant activation.
+Le [guide Home Assistant Container, Dockge et Nginx Proxy Manager](docs/APPAIRAGE_DIRECT_3C4B7.md) décrit le mode natif optionnel et les vérifications avant activation.
 
 ## Tests Python ciblés
 
