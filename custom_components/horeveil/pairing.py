@@ -370,12 +370,17 @@ class PairingRegistry:
             del self._invitations[invitation_id]
             return True
 
-    async def async_discard_invitations(self) -> None:
-        """Clear all pending invitations when the local test shuts down."""
+    async def async_discard_invitations(self, *, origin: str | None = None) -> None:
+        """Clear pending invitations for one origin, or all on shutdown."""
         async with self._lock:
-            self._invitations.clear()
+            self._invitations = {
+                key: value for key, value in self._invitations.items()
+                if origin is not None and value.origin != origin
+            }
 
-    async def async_claim(self, code: str, claim: PairingClaim) -> PairingReservation:
+    async def async_claim(
+        self, code: str, claim: PairingClaim, *, origin: str | None = None,
+    ) -> PairingReservation:
         """Reserve an invitation or return the same reservation on an exact retry."""
         digest = _invitation_digest(code)
         if len(claim.credential_digest) != 32:
@@ -384,7 +389,7 @@ class PairingRegistry:
             server_id = self.server_id
             self._prune_expired(self._clock())
             for invitation_id, pending in self._invitations.items():
-                if not compare_digest(pending.digest, digest):
+                if (origin is not None and pending.origin != origin) or not compare_digest(pending.digest, digest):
                     continue
                 reservation = pending.reservation
                 if reservation is not None:
@@ -457,7 +462,7 @@ class PairingRegistry:
             )
 
     async def async_check_pairing(
-        self, pairing_id: UUID, secret: bytes, *, confirm: bool = False,
+        self, pairing_id: UUID, secret: bytes, *, confirm: bool = False, origin: str | None = None,
     ) -> PairingStatus:
         """Authenticate a status request or explicitly finalize an approved claim."""
         if len(secret) != 32:
@@ -465,10 +470,13 @@ class PairingRegistry:
         digest = sha256(secret).digest()
         async with self._lock:
             _ = self.server_id
-            if self._active_with_digest(pairing_id, digest) is not None:
+            active = self._active_with_digest(pairing_id, digest)
+            if active is not None and (origin is None or active.origin == origin):
                 return PairingStatus.ACTIVE
             invitation_id, pending, reservation = self._find_reservation(pairing_id)
-            if not compare_digest(reservation.claim.credential_digest, digest):
+            if (origin is not None and pending.origin != origin) or not compare_digest(
+                reservation.claim.credential_digest, digest,
+            ):
                 raise InvalidPairingCredential("Invalid pairing credential")
             if not confirm:
                 return reservation.status
@@ -546,6 +554,18 @@ class PairingRegistry:
         """Check proof of possession for exactly one active association."""
         async with self._lock:
             return self._active_with_digest(pairing_id, sha256(secret).digest()) if len(secret) == 32 else None
+
+    async def async_authorize_consultation(
+        self, pairing_id: UUID, secret: bytes, origin: str, permission: Consultation,
+    ) -> bool:
+        """Check the two grants for a future read-only capability."""
+        async with self._lock:
+            association = self._active_with_digest(pairing_id, sha256(secret).digest()) if len(secret) == 32 else None
+            return (
+                association is not None and association.origin == origin
+                and permission in association.ha_permissions.consultation
+                and permission in association.phone_permissions.consultation
+            )
 
     async def async_revoke(self, pairing_id: UUID) -> bool:
         """Persist an irreversible tombstone for one association."""

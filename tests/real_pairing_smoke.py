@@ -13,12 +13,14 @@ from secrets import token_bytes
 from shutil import copytree
 import socket
 import ssl
+import subprocess
 from tempfile import TemporaryDirectory
 from time import monotonic
 from unittest.mock import patch
 from uuid import uuid4
 
 from aiohttp import ClientConnectionError, ClientSession, TCPConnector, ThreadedResolver
+from aiohttp.abc import AbstractResolver
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -34,9 +36,10 @@ _BASE = "/api/horeveil/v1/pair"
 _PANEL = "horeveil-association"
 _SUGGESTED = "https://recette.example.invalid"
 _ROOT = Path(__file__).resolve().parents[1]
+_PUBLIC_NAME = "pairing.example.invalid"
 
 
-def _certificate_files(profile):
+def _certificate_files(profile, nginx):
     now = datetime.now(UTC)
     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     issuer = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "CA Horéveil de recette")])
@@ -57,13 +60,16 @@ def _certificate_files(profile):
     ).sign(ca_key, hashes.SHA256())
     (profile / "ca.pem").write_bytes(ca.public_bytes(serialization.Encoding.PEM))
 
-    def write(name, purpose):
+    def write(name, purpose, dns=None):
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         subject = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, name)])
+        names = [x509.IPAddress(IPv4Address("127.0.0.1"))]
+        if dns:
+            names.append(x509.DNSName(dns))
         certificate = build(subject, key).add_extension(
             x509.ExtendedKeyUsage([purpose]), critical=False,
         ).add_extension(
-            x509.SubjectAlternativeName([x509.IPAddress(IPv4Address("127.0.0.1"))]), critical=False,
+            x509.SubjectAlternativeName(names), critical=False,
         ).sign(ca_key, hashes.SHA256())
         (profile / f"{name}.pem").write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
         key_path = profile / f"{name}.key"
@@ -73,8 +79,12 @@ def _certificate_files(profile):
         ))
         return certificate.fingerprint(hashes.SHA256()).hex()
 
-    write("serveur", x509.ExtendedKeyUsageOID.SERVER_AUTH)
-    return write("client", x509.ExtendedKeyUsageOID.CLIENT_AUTH)
+    write("serveur", x509.ExtendedKeyUsageOID.SERVER_AUTH, "horeveil-gateway.example.invalid")
+    admin = write("client", x509.ExtendedKeyUsageOID.CLIENT_AUTH)
+    if not nginx:
+        return admin, None
+    write("public", x509.ExtendedKeyUsageOID.SERVER_AUTH, _PUBLIC_NAME)
+    return admin, write("proxy", x509.ExtendedKeyUsageOID.CLIENT_AUTH)
 
 
 def _b64(data):
@@ -226,7 +236,146 @@ async def _test_api(hass, profile, origin, admin, guest):
                 assert response.status == 401
 
 
-async def _test_browser(hass, profile, origin, admin, channel, component):
+class _LoopbackResolver(AbstractResolver):
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        assert host == _PUBLIC_NAME
+        return [{"hostname": host, "host": "127.0.0.1", "port": port,
+                 "family": socket.AF_INET, "proto": socket.IPPROTO_TCP, "flags": 0}]
+
+    async def close(self):
+        pass
+
+
+async def _test_proxy(hass, profile, origin, public, backend_port, nginx, admin, guest):
+    port = int(public.rsplit(":", 1)[1])
+    template = (_ROOT / "docs" / "nginx-horeveil-pairing.conf").read_text("utf-8")
+    vhost = template.replace("listen 443 ssl;", f"listen 127.0.0.1:{port} ssl;").replace(
+        "/chemin/prive/", profile.as_posix() + "/",
+    ).replace("127.0.0.1:18443", f"127.0.0.1:{backend_port}").replace(
+        "https://pairing.example.invalid;", public + ";",
+    )
+    (profile / "nginx.conf").write_text(
+        "daemon off; master_process off; events {}\nhttp {\n" + vhost + "\n}", encoding="utf-8",
+    )
+    (profile / "logs").mkdir()
+    (profile / "temp").mkdir()
+    process = await asyncio.create_subprocess_exec(
+        str(nginx.resolve()), "-p", profile.as_posix() + "/", "-c", "nginx.conf",
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        tls = ssl.create_default_context(cafile=profile / "ca.pem")
+        async with ClientSession(connector=TCPConnector(ssl=tls, resolver=_LoopbackResolver())) as phone:
+            test_url = public + _BASE
+            for _ in range(20):
+                try:
+                    async with phone.get(test_url + "/status", allow_redirects=False) as response:
+                        assert response.status == 404
+                    break
+                except ClientConnectionError:
+                    if process.returncode is not None:
+                        raise RuntimeError((await process.stderr.read()).decode(errors="replace"))
+                    await asyncio.sleep(0.1)
+            else:
+                raise AssertionError("Nginx did not start")
+            admin_tls = ssl.create_default_context(cafile=profile / "ca.pem")
+            admin_tls.load_cert_chain(profile / "client.pem", profile / "client.key")
+            async with ClientSession(connector=TCPConnector(ssl=admin_tls, resolver=ThreadedResolver())) as local:
+                async with local.ws_connect(origin + "/api/websocket") as ws:
+                    assert await _authenticate(ws, guest["access_token"]) == "auth_ok"
+                    assert not (await _pair(ws, "direct_access", enabled=True, confirmed=True, origin=public))["success"]
+                async with local.ws_connect(origin + "/api/websocket") as ws:
+                    assert await _authenticate(ws, admin["access_token"]) == "auth_ok"
+                    assert not (await _pair(ws, "direct_access", enabled=True, confirmed=False, origin=public))["success"]
+                    assert not (await _pair(ws, "invite", origin=public))["success"]
+                    assert (await _pair(ws, "direct_access", enabled=True, confirmed=True, origin=public))["success"]
+                    async with phone.get(test_url + "/status", allow_redirects=False) as response:
+                        assert response.status == 401
+                    spoofed = {
+                        "X-Forwarded-For": "192.0.2.22", "X-Horeveil-Proxy-Scheme": "http",
+                        "X-Horeveil-Proxy-Origin": "https://incorrect.example.invalid",
+                    }
+                    async with phone.get(test_url + "/status", headers=spoofed) as response:
+                        assert response.status == 401
+                    async with phone.get(test_url + "/status", headers={"Host": "wrong.example.invalid"}) as response:
+                        assert response.status == 421
+                    for path in (
+                        "/api/webhook/test", "/api/websocket", "/api/horeveil/v1/calendar/snapshot",
+                        _BASE + "/status?unexpected=1",
+                    ):
+                        async with phone.get(public + path, allow_redirects=False) as response:
+                            assert response.status == 404 and "Location" not in response.headers
+                    async with phone.get(test_url.replace("https:", "http:") + "/status", allow_redirects=False) as response:
+                        assert response.status == 400 and "Location" not in response.headers
+                    metadata = {
+                        "X-Horeveil-Proxy-Scheme": "https", "X-Horeveil-Proxy-Origin": public,
+                        "X-Horeveil-Proxy-Client-IP": "192.0.2.5",
+                    }
+                    backend_status = f"https://127.0.0.1:{backend_port}" + _BASE + "/status"
+                    async with local.get(backend_status, headers=metadata) as response:
+                        assert response.status == 404
+                    proxy_tls = ssl.create_default_context(cafile=profile / "ca.pem")
+                    proxy_tls.load_cert_chain(profile / "proxy.pem", profile / "proxy.key")
+                    async with ClientSession(connector=TCPConnector(ssl=proxy_tls, resolver=ThreadedResolver())) as proxy:
+                        insecure = {**metadata, "X-Horeveil-Proxy-Scheme": "http"}
+                        async with proxy.get(backend_status, headers=insecure) as response:
+                            assert response.status == 404
+                    key = serialization.load_pem_private_key((profile / "client.key").read_bytes(), password=None)
+
+                    async def invite(target):
+                        result = (await _pair(ws, "invite", origin=target))["result"]
+                        return result["invitation_id"], _decode_code(result["code_encrypted"], key)
+
+                    secret = token_bytes(32)
+                    body = {
+                        "claim_id": str(uuid4()), "installation_id": str(uuid4()),
+                        "phone_label": "Recette Nginx", "credential_digest": _b64(sha256(secret).digest()),
+                    }
+
+                    async def claim(code, expected):
+                        async with phone.post(
+                            test_url + "/claim", json=body, headers={"X-Horeveil-Invitation": code},
+                        ) as response:
+                            assert response.status == expected
+                            return await response.json()
+
+                    await claim("0" * 26, 401)
+                    local_id, local_code = await invite(origin)
+                    await claim(local_code, 401)
+                    assert (await _pair(ws, "cancel", invitation_id=local_id))["success"]
+                    _, expired = await invite(public)
+                    registry = hass.data["horeveil.local_pairing_test"].registry
+                    with patch.object(registry, "_clock", lambda: monotonic() + 300):
+                        await claim(expired, 401)
+                    invitation_id, code = await invite(public)
+                    reserved = await claim(code, 200)
+                    assert await claim(code, 200) == reserved
+                    pairing_id = reserved["pairing_id"]
+                    credential = {"X-Horeveil-Authorization": f"v1 {pairing_id}.{_b64(secret)}"}
+                    confirmed = {"confirmed": True}
+                    async with phone.post(test_url + "/activate", headers=credential, json=confirmed) as response:
+                        assert response.status == 403
+                    assert (await _pair(ws, "approve", invitation_id=invitation_id, pairing_id=pairing_id,
+                                        **confirmed))["success"]
+                    for _ in range(2):
+                        async with phone.post(test_url + "/activate", headers=credential, json=confirmed) as response:
+                            assert (await response.json())["state"] == "active"
+                    async with local.get(origin + _BASE + "/status", headers=credential) as response:
+                        assert response.status == 401
+                    assert (await _pair(ws, "revoke", pairing_id=pairing_id, **confirmed))["success"]
+                    async with phone.get(test_url + "/status", headers=credential) as response:
+                        assert response.status == 401
+                    assert (await _pair(ws, "direct_access", enabled=False, confirmed=True))["success"]
+                    async with phone.get(test_url + "/status") as response:
+                        assert response.status == 404
+    finally:
+        if process.returncode is None:
+            process.terminate()
+            await process.wait()
+
+
+async def _test_browser(hass, profile, origin, admin, channel, component, direct_origin=None):
     from playwright.async_api import async_playwright, expect
 
     flow = await hass.config_entries.flow.async_init(_DOMAIN, context={"source": "user"})
@@ -295,6 +444,15 @@ async def _test_browser(hass, profile, origin, admin, channel, component):
                 await expect(panel.locator("#origin")).to_have_value(_SUGGESTED)
                 await expect(panel.locator("#host")).to_have_text("recette.example.invalid")
                 await expect(panel.locator("#create")).to_be_disabled()
+                if direct_origin:
+                    await panel.locator("#origin").fill(direct_origin)
+                    await expect(panel.locator("#direct-toggle")).to_be_disabled()
+                    await panel.locator("#direct-confirm").check()
+                    await panel.locator("#direct-toggle").click()
+                    await expect(panel.locator("#direct-state")).to_contain_text(direct_origin)
+                    await expect(panel.locator("#create")).to_be_enabled()
+                    await panel.locator("#direct-toggle").click()
+                    await expect(panel.locator("#direct-state")).to_have_text("Accès direct désactivé")
                 await panel.locator("#origin").fill(origin)
                 await expect(panel.locator("#create")).to_be_enabled()
                 await expect(panel.locator("input[value=read]")).to_be_checked()
@@ -352,14 +510,18 @@ async def _test_browser(hass, profile, origin, admin, channel, component):
                 await browser.close()
 
 
-async def main(browser, channel, component):
+def _free_port():
+    with socket.socket() as port_picker:
+        port_picker.bind(("127.0.0.1", 0))
+        return port_picker.getsockname()[1]
+
+
+async def main(browser, channel, component, nginx):
     with TemporaryDirectory(prefix="horeveil-ha-") as directory:
         profile = Path(directory)
         copytree(_ROOT / "custom_components" / _DOMAIN, profile / "custom_components" / _DOMAIN)
-        fingerprint = _certificate_files(profile)
-        with socket.socket() as port_picker:
-            port_picker.bind(("127.0.0.1", 0))
-            port = port_picker.getsockname()[1]
+        fingerprint, proxy_fingerprint = _certificate_files(profile, nginx)
+        port = _free_port()
         origin = f"https://127.0.0.1:{port}"
         hass = HomeAssistant(directory)
         loader.async_setup(hass)
@@ -374,6 +536,14 @@ async def main(browser, channel, component):
             "frontend": {}, "config": {}, "lovelace": {}, "repairs": {}, "recorder": {},
             _DOMAIN: {"local_pairing_test_client_sha256": fingerprint},
         }
+        if nginx:
+            backend_port = _free_port()
+            direct_origin = f"https://{_PUBLIC_NAME}:{_free_port()}"
+            config[_DOMAIN]["direct_pairing"] = {
+                "port": backend_port, "certificate": str(profile / "serveur.pem"),
+                "key": str(profile / "serveur.key"), "client_ca": str(profile / "ca.pem"),
+                "admin_certificate_sha256": fingerprint, "proxy_certificate_sha256": proxy_fingerprint,
+            }
         try:
             assert await bootstrap.async_from_config_dict(config, hass) is hass
             await hass.async_start()
@@ -381,8 +551,11 @@ async def main(browser, channel, component):
             guest = await _token(hass, "Utilisateur de recette", origin, administrator=False)
             await _test_api(hass, profile, origin, admin, guest)
             print("Core natif : panneau, authentification, invitations, origine, permissions et révocation OK.", flush=True)
+            if nginx:
+                await _test_proxy(hass, profile, origin, direct_origin, backend_port, nginx, admin, guest)
+                print("Nginx réel : TLS, opt-in, en-têtes, association et révocation OK.", flush=True)
             if browser:
-                await _test_browser(hass, profile, origin, admin, channel, component)
+                await _test_browser(hass, profile, origin, admin, channel, component, direct_origin if nginx else None)
                 path = "composant monté avec la session HA réelle" if component else "ouverture depuis la fiche Horéveil"
                 print(f"Frontend HA et navigateur : {path}, association et révocation OK.")
         finally:
@@ -393,6 +566,7 @@ if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--browser", action="store_true", help="Exercise the installed HA frontend with Playwright.")
     parser.add_argument("--channel", help="Optional installed browser channel, e.g. chrome.")
+    parser.add_argument("--nginx", type=Path, help="Exercise the documented vhost with this nginx executable.")
     parser.add_argument(
         "--component", action="store_true",
         help="Mount the real component in the authenticated frontend without testing its router.",
@@ -400,4 +574,4 @@ if __name__ == "__main__":
     arguments = parser.parse_args()
     if arguments.component and not arguments.browser:
         parser.error("--component requires --browser")
-    asyncio.run(main(arguments.browser, arguments.channel, arguments.component))
+    asyncio.run(main(arguments.browser, arguments.channel, arguments.component, arguments.nginx))

@@ -1,6 +1,7 @@
 """Focused pairing tests with independent reads of simulated HA stores."""
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -170,6 +171,30 @@ class PairingTests(unittest.IsolatedAsyncioTestCase):
                 await revocation
         _, self.registry = await self.open_registry()
         self.assertIsNone(await self.registry.async_authenticate(entry.pairing_id, secret))
+
+    async def test_association_proof_and_permissions_are_bound_to_origin(self):
+        invitation = await self.invite()
+        entry, secret = await self.activate(invitation)
+        foreign = "https://other.example"
+        calendar = pairing_module.Consultation.CALENDAR
+        self.assertEqual(
+            await self.registry.async_check_pairing(entry.pairing_id, secret, origin=invitation.origin),
+            pairing_module.PairingStatus.ACTIVE,
+        )
+        with self.assertRaises(pairing_module.InvalidPairingCredential):
+            await self.registry.async_check_pairing(entry.pairing_id, secret, origin=foreign)
+        authorize = self.registry.async_authorize_consultation
+        self.assertFalse(await authorize(entry.pairing_id, secret, invitation.origin, calendar))
+        grant = Permissions(consultation=frozenset({calendar}))
+        self.registry._associations[entry.pairing_id] = replace(entry, ha_permissions=grant)
+        self.assertFalse(await authorize(entry.pairing_id, secret, invitation.origin, calendar))
+        self.registry._associations[entry.pairing_id] = replace(
+            entry, ha_permissions=grant, phone_permissions=grant,
+        )
+        self.assertTrue(await authorize(entry.pairing_id, secret, invitation.origin, calendar))
+        self.assertFalse(await authorize(entry.pairing_id, secret, foreign, calendar))
+        await self.registry.async_revoke(entry.pairing_id)
+        self.assertFalse(await authorize(entry.pairing_id, secret, invitation.origin, calendar))
 
     def test_origin_validation(self):
         self.assertEqual(validate_origin("https://[2001:0DB8::1]:8123/"), "https://[2001:db8::1]:8123")

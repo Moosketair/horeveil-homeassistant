@@ -123,9 +123,11 @@ class PairingHttp:
         *,
         local_source: Callable[[web.Request], Source | None] | None = None,
         clock: Callable[[], float] = monotonic,
+        origin: str | None = None,
     ) -> None:
         self._registry = registry
         self._local_source = local_source
+        self._origin = origin
         self._clock = clock
         self._window_end = 0.0
         self._total = 0
@@ -187,12 +189,15 @@ class PairingHttp:
         label = payload["phone_label"]
         if not isinstance(label, str) or not label.strip() or len(label) > 64 or not label.isprintable():
             raise _InvalidRequest
+        if self._local_source is None or self._local_source(request) is None:
+            raise InvalidPairingCredential("Ingress no longer available")
         reservation = await self._registry.async_claim(
             code,
             PairingClaim(
                 _uuid(payload["claim_id"]), _uuid(payload["installation_id"]),
                 label, _decode_32(payload["credential_digest"]),
             ),
+            origin=self._origin,
         )
         return {
             "pairing_id": str(reservation.pairing_id),
@@ -211,8 +216,12 @@ class PairingHttp:
         pairing_id, secret = _credential(request)
         if (await _json_body(request, {"confirmed"}))["confirmed"] is not True:
             raise _InvalidRequest
+        if self._local_source is None or self._local_source(request) is None:
+            raise InvalidPairingCredential("Ingress no longer available")
         return await self._check(pairing_id, secret, confirm=True)
 
     async def _check(self, pairing_id: UUID, secret: bytes, *, confirm: bool) -> dict:
-        state = await self._registry.async_check_pairing(pairing_id, secret, confirm=confirm)
+        state = await self._registry.async_check_pairing(
+            pairing_id, secret, confirm=confirm, origin=self._origin,
+        )
         return {"pairing_id": str(pairing_id), "server_id": str(self._registry.server_id), "state": state.value}

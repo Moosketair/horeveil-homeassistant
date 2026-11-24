@@ -16,12 +16,14 @@ PLATFORMS = (Platform.CALENDAR, Platform.SENSOR)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """Set up the optional isolated pairing test without affecting entries."""
+    """Set up optional pairing access separately from the receiver entries."""
     options = config.get(DOMAIN)
-    if isinstance(options, dict) and "local_pairing_test_client_sha256" in options:
+    if isinstance(options, dict) and {"local_pairing_test_client_sha256", "direct_pairing"} & options.keys():
         from .pairing_ha import async_setup_local_pairing
 
-        await async_setup_local_pairing(hass, options["local_pairing_test_client_sha256"])
+        await async_setup_local_pairing(
+            hass, options.get("local_pairing_test_client_sha256"), options.get("direct_pairing"),
+        )
     return True
 
 

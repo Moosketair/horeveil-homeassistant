@@ -35,7 +35,14 @@ const template = `
           <button id="create" type="submit" disabled>Confirmer et créer l’invitation</button>
         </form>
         <p id="availability"></p>
-        <p class="muted">QR indisponible dans ce mode. Les routes sont limitées à cet hôte, où un simulateur peut utiliser le code manuel.</p>
+        <p class="muted">QR indisponible tant que le parcours Android n’a pas été qualifié.</p>
+        <div id="direct" hidden>
+          <p id="direct-state"></p>
+          <label id="direct-confirm-label"><input id="direct-confirm" type="checkbox">
+            Je confirme l’origine et le relais HTTPS configuré.
+          </label>
+          <button id="direct-toggle" type="button" disabled>Activer l’accès direct</button>
+        </div>
         <div id="invitation" hidden>
           <p>État <strong id="state"></strong></p>
           <p>Expiration <time id="expires"></time></p>
@@ -117,6 +124,9 @@ class HoreveilAssociation extends HTMLElement {
   #generation = 0;
   #busy = false;
   #testOrigin;
+  #directOrigin;
+  #directConfigured = false;
+  #loaded = false;
   #invitation;
   #timer;
 
@@ -127,11 +137,17 @@ class HoreveilAssociation extends HTMLElement {
       event.preventDefault();
       this.#create();
     });
-    this.#element("origin").addEventListener("input", () => this.#address());
+    this.#element("origin").addEventListener("input", () => {
+      this.#element("direct-confirm").checked = false;
+      this.#address();
+    });
     this.#element("local").onclick = () => {
       this.#element("origin").value = this.#testOrigin;
+      this.#element("direct-confirm").checked = false;
       this.#address();
     };
+    this.#element("direct-confirm").onchange = () => this.#address();
+    this.#element("direct-toggle").onclick = () => this.#toggleDirect();
     this.#element("compared").onchange = () => this.#invitationState();
     this.#element("approve").onclick = () => this.#decide(true);
     this.#element("cancel").onclick = () => this.#decide(false);
@@ -176,6 +192,10 @@ class HoreveilAssociation extends HTMLElement {
     this.#generation += 1;
     this.#busy = false;
     this.#testOrigin = undefined;
+    this.#directOrigin = undefined;
+    this.#directConfigured = false;
+    this.#loaded = false;
+    this.#element("direct-confirm").checked = false;
     this.#dropInvitation();
     this.#element("content").hidden = true;
     this.#element("origin").value = "";
@@ -216,11 +236,21 @@ class HoreveilAssociation extends HTMLElement {
 
   #address() {
     const parsed = parseOrigin(this.#element("origin").value.trim());
-    const usable = parsed && parsed.origin === this.#testOrigin;
+    const usable = parsed && [this.#testOrigin, this.#directOrigin].includes(parsed.origin);
     this.#element("host").textContent = parsed?.host ?? "—";
     this.#element("availability").textContent = usable
-      ? "Adresse autorisée pour la recette sur cet hôte."
-      : `Seule l’adresse de recette ${this.#testOrigin ?? ""} peut servir à créer une invitation.`;
+      ? "Adresse autorisée pour créer une invitation. La joignabilité n’est pas vérifiée."
+      : "Choisissez une adresse de recette ou confirmez le relais HTTPS avant de créer une invitation.";
+    this.#element("local").hidden = !this.#testOrigin;
+    this.#element("direct").hidden = !this.#directConfigured;
+    this.#element("direct-state").textContent = this.#directOrigin
+      ? `Accès direct actif sur ${this.#directOrigin}` : "Accès direct désactivé";
+    this.#element("direct-toggle").textContent = this.#directOrigin
+      ? "Désactiver l’accès direct" : "Activer l’accès direct";
+    this.#element("direct-confirm-label").hidden = Boolean(this.#directOrigin);
+    this.#element("direct-toggle").disabled = this.#busy || (!this.#directOrigin && (
+      !parsed || parsed.origin === this.#testOrigin || !this.#element("direct-confirm").checked
+    ));
     this.#element("create").disabled = !usable || this.#busy || Boolean(this.#invitation);
     return usable ? parsed.origin : null;
   }
@@ -228,8 +258,11 @@ class HoreveilAssociation extends HTMLElement {
   async #load(generation) {
     const info = await this.#call("info");
     if (generation !== this.#generation) return;
-    if (!this.#testOrigin) this.#element("origin").value = info.suggested_origin;
+    if (!this.#loaded) this.#element("origin").value = info.suggested_origin ?? "";
+    this.#loaded = true;
     this.#testOrigin = info.test_origin;
+    this.#directOrigin = info.direct_origin;
+    this.#directConfigured = info.direct_configured === true;
     this.#element("content").hidden = false;
     this.#element("empty").hidden = info.phones.length > 0;
     this.#element("phones").replaceChildren(...info.phones.map((id) => {
@@ -244,6 +277,22 @@ class HoreveilAssociation extends HTMLElement {
     }));
     this.#notice("");
     return info.phones;
+  }
+
+  #toggleDirect() {
+    const enabled = !this.#directOrigin;
+    const origin = parseOrigin(this.#element("origin").value.trim())?.origin;
+    if (enabled && (!origin || !this.#element("direct-confirm").checked)) return;
+    this.#run(async (generation) => {
+      const fields = { enabled, confirmed: true };
+      if (enabled) fields.origin = origin;
+      const result = await this.#call("direct_access", fields);
+      if (generation !== this.#generation) return;
+      if (!enabled && this.#invitation?.origin === this.#directOrigin) this.#dropInvitation();
+      this.#directOrigin = result.direct_origin;
+      this.#element("direct-confirm").checked = false;
+      this.#notice(enabled ? "Accès direct activé pour cette session de Home Assistant." : "Accès direct désactivé.");
+    }, "Impossible de modifier l’accès direct. Vérifiez le relais HTTPS et l’origine.");
   }
 
   #create() {

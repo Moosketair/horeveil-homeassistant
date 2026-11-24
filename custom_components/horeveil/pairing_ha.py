@@ -1,8 +1,6 @@
 """Native HA wiring for an explicitly enabled, isolated pairing test."""
 
 from base64 import urlsafe_b64decode, urlsafe_b64encode
-from hashlib import sha256
-from hmac import compare_digest
 from ipaddress import IPv4Address
 import logging
 from pathlib import Path
@@ -29,12 +27,11 @@ from homeassistant.exceptions import HomeAssistantError
 from .const import DOMAIN
 from .pairing import InvalidPairingCredential, PairingError, PairingRegistry, validate_origin
 from .pairing_http import PairingHttp
+from .pairing_proxy import PAIRING_BASE, FINGERPRINT, PairingProxy, build_proxy_tls, direct_tls, pinned_certificate
 
 _LOGGER = logging.getLogger(__name__)
-_BASE = "/api/horeveil/v1/pair"
 _WS = "horeveil/pairing_test"
 _LOOPBACK = IPv4Address("127.0.0.1")
-_FINGERPRINT = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _OAEP = padding.OAEP(
     mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None,
 )
@@ -50,55 +47,49 @@ def _supports_local_test(server) -> bool:
         getattr(server, "server_host", None) == ["127.0.0.1"]
         and getattr(server, "trusted_proxies", None) == []
         and getattr(server, "supervisor_unix_socket_path", None) is None
-        and getattr(server, "ssl_peer_certificate", None) is not None
+        and _supports_admin_tls(server)
+    )
+
+
+def _supports_admin_tls(server) -> bool:
+    return (
+        getattr(server, "ssl_peer_certificate", None) is not None
         and getattr(getattr(server, "context", None), "verify_mode", None) == ssl.CERT_REQUIRED
     )
 
 
-class _LocalPairingTest:
-    def __init__(self, registry: PairingRegistry, fingerprint: bytes, port: int) -> None:
+class _PairingRuntime:
+    def __init__(
+        self, registry: PairingRegistry, fingerprint: bytes, port: int, *,
+        local_test: bool, proxy: PairingProxy | None,
+    ) -> None:
         self.registry = registry
         self.active = True
         self.fingerprint = fingerprint
-        self.origin = validate_origin(f"https://{_LOOPBACK}:{port}")
-        self.http = PairingHttp(registry, local_source=self.local_source)
+        self.origin = validate_origin(f"https://{_LOOPBACK}:{port}") if local_test else None
+        self.proxy = proxy
+        self.http = PairingHttp(registry, local_source=self.local_source, origin=self.origin)
 
     def client_key(self, request: web.Request | None) -> rsa.RSAPublicKey | None:
         """Authenticate the direct loopback socket and its pinned client certificate."""
-        if (
-            not self.active or request is None or not request.secure
-            or remote.is_cloud_request.get() or request.transport is None
-            or any(
-                name.lower().startswith(("x-forwarded-", "x-ha-cloud"))
-                or name.lower() in {"forwarded", "via", "x-real-ip"}
-                for name in request.headers
-            )
-        ):
+        if not self.active or remote.is_cloud_request.get():
             return None
-        transport = request.transport
-        peer = transport.get_extra_info("peername")
-        local = transport.get_extra_info("sockname")
-        tls = transport.get_extra_info("ssl_object")
-        if (
-            request.remote != str(_LOOPBACK) or not isinstance(peer, tuple) or len(peer) != 2
-            or peer[0] != str(_LOOPBACK) or not isinstance(local, tuple) or len(local) != 2
-            or local[0] != str(_LOOPBACK) or tls is None or tls.context.verify_mode != ssl.CERT_REQUIRED
-        ):
+        tls = direct_tls(request)
+        if tls is None or (certificate := pinned_certificate(tls, self.fingerprint)) is None:
             return None
         try:
-            certificate = tls.getpeercert(binary_form=True)
-            if not certificate or not compare_digest(sha256(certificate).digest(), self.fingerprint):
-                return None
             key = x509.load_der_x509_certificate(certificate).public_key()
         except (UnsupportedAlgorithm, ValueError, ssl.SSLError):
             return None
         return key if isinstance(key, rsa.RSAPublicKey) and key.key_size >= 2048 else None
 
     def local_source(self, request: web.Request) -> IPv4Address | None:
-        return _LOOPBACK if self.client_key(request) is not None else None
+        return _LOOPBACK if self.origin is not None and self.client_key(request) is not None else None
 
     async def stop(self, _event) -> None:
         self.active = False
+        if self.proxy is not None:
+            await self.proxy.async_disable()
         await self.registry.async_discard_invitations()
 
 
@@ -106,12 +97,12 @@ class _PairView(HomeAssistantView):
     requires_auth = False  # PairingHttp authenticates the phone after the socket gate.
     cors_allowed = False
 
-    def __init__(self, test: _LocalPairingTest) -> None:
+    def __init__(self, test: _PairingRuntime) -> None:
         self.test = test
 
 
 class _ClaimView(_PairView):
-    url = f"{_BASE}/claim"
+    url = f"{PAIRING_BASE}/claim"
     name = "api:horeveil:pair:claim"
 
     async def post(self, request: web.Request) -> web.Response:
@@ -119,7 +110,7 @@ class _ClaimView(_PairView):
 
 
 class _StatusView(_PairView):
-    url = f"{_BASE}/status"
+    url = f"{PAIRING_BASE}/status"
     name = "api:horeveil:pair:status"
 
     async def get(self, request: web.Request) -> web.Response:
@@ -127,7 +118,7 @@ class _StatusView(_PairView):
 
 
 class _ActivateView(_PairView):
-    url = f"{_BASE}/activate"
+    url = f"{PAIRING_BASE}/activate"
     name = "api:horeveil:pair:activate"
 
     async def post(self, request: web.Request) -> web.Response:
@@ -185,7 +176,7 @@ class _AdminOperation:
         if self.user is not None and self.user.is_active and self.user.is_admin:
             self.key = self.test.client_key(current_request.get())
         if self.key is None:
-            self.connection.send_error(self.msg_id, "unauthorized", "Local test access required")
+            self.connection.send_error(self.msg_id, "unauthorized", "Local administrator mTLS required")
 
     def result(self, data: dict) -> None:
         self.connection.send_result(self.msg_id, data)
@@ -205,13 +196,20 @@ async def _invite(hass, connection, msg) -> None:
         return
     try:
         origin = msg.get("origin")
-        if not isinstance(origin, str) or validate_origin(origin) != operation.test.origin:
+        if not isinstance(origin, str):
             operation.error("invalid_origin")
             return
+        origin = validate_origin(origin)
         recipient = _recipient(msg.get("display_key"), operation.key)
-        invitation = await operation.test.registry.async_invite(
-            administrator_id=operation.user.id, confirmed_origin=operation.test.origin,
-        )
+        if origin == operation.test.origin:
+            invitation = await operation.test.registry.async_invite(
+                administrator_id=operation.user.id, confirmed_origin=origin,
+            )
+        elif operation.test.proxy is not None and origin == operation.test.proxy.origin:
+            invitation = await operation.test.proxy.async_invite(origin, operation.user.id)
+        else:
+            operation.error("invalid_origin")
+            return
         operation.result({
             "invitation_id": str(invitation.invitation_id),
             "origin": invitation.origin,
@@ -307,11 +305,14 @@ async def _info(hass, connection, msg) -> None:
     except PairingError:
         operation.error("registry_unavailable")
         return
-    operation.result({
+    result = {
         "suggested_origin": suggestion or operation.test.origin,
         "test_origin": operation.test.origin,
         "phones": [str(pairing_id) for pairing_id in active],
-    })
+    }
+    if operation.test.proxy is not None:
+        result.update(direct_configured=True, direct_origin=operation.test.proxy.origin)
+    operation.result(result)
 
 
 @websocket_api.websocket_command({"type": f"{_WS}/revoke", "pairing_id": str, "confirmed": bool})
@@ -334,16 +335,61 @@ async def _revoke(hass, connection, msg) -> None:
         operation.error("registry_unavailable")
 
 
-async def async_setup_local_pairing(hass: HomeAssistant, fingerprint: object) -> None:
-    """Register only on an explicitly opted-in, isolated native HA HTTP server."""
-    server = hass.http
-    if (
-        not isinstance(fingerprint, str) or not _FINGERPRINT.fullmatch(fingerprint)
-        or not _supports_local_test(server)
-    ):
-        _LOGGER.warning("Horéveil local pairing test is disabled: incompatible HTTP configuration")
+@websocket_api.websocket_command({
+    "type": f"{_WS}/direct_access", "enabled": bool, "confirmed": bool,
+    probatio.Optional("origin"): str,
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _direct_access(hass, connection, msg) -> None:
+    operation = _AdminOperation(hass, connection, msg)
+    if operation.key is None:
         return
+    proxy = operation.test.proxy
+    if proxy is None or msg.get("confirmed") is not True:
+        operation.error("direct_unavailable")
+        return
+    try:
+        origin = msg.get("origin")
+        if msg.get("enabled") is True and isinstance(origin, str):
+            await proxy.async_enable(origin)
+        elif msg.get("enabled") is False:
+            await proxy.async_disable()
+        else:
+            raise PairingError("Explicit gateway origin required")
+        operation.result({"direct_origin": proxy.origin})
+    except (OSError, PairingError):
+        operation.error("direct_unavailable")
+
+
+async def async_setup_local_pairing(
+    hass: HomeAssistant, fingerprint: object, direct_options: object = None,
+) -> None:
+    """Prepare native administration and any explicitly configured access modes."""
+    server = hass.http
+    local_test = isinstance(fingerprint, str) and FINGERPRINT.fullmatch(fingerprint) and _supports_local_test(server)
+    if fingerprint is not None and not local_test:
+        _LOGGER.warning("Horéveil local pairing test is disabled: incompatible HTTP configuration")
     if _RUNTIME_KEY in hass.data:
+        return
+    proxy_config = None
+    admin_fingerprint = fingerprint if local_test else None
+    if direct_options is not None:
+        try:
+            if not isinstance(direct_options, dict) or not _supports_admin_tls(server):
+                raise PairingError("Native administrator mTLS required")
+            admin = direct_options.get("admin_certificate_sha256")
+            if (
+                not isinstance(admin, str) or not FINGERPRINT.fullmatch(admin)
+                or admin == direct_options.get("proxy_certificate_sha256")
+                or (admin_fingerprint is not None and admin_fingerprint != admin)
+            ):
+                raise PairingError("Distinct administrator and gateway certificates required")
+            proxy_config = await hass.async_add_executor_job(build_proxy_tls, direct_options)
+            admin_fingerprint = admin
+        except (OSError, PairingError, ValueError):
+            _LOGGER.warning("Horéveil direct pairing is disabled: incompatible TLS configuration")
+    if admin_fingerprint is None:
         return
     try:
         registry = await PairingRegistry.async_open(hass)
@@ -352,11 +398,17 @@ async def async_setup_local_pairing(hass: HomeAssistant, fingerprint: object) ->
         return
     if _RUNTIME_KEY in hass.data:
         return
-    test = _LocalPairingTest(registry, bytes.fromhex(fingerprint), server.server_port)
-    for view in (_ClaimView, _StatusView, _ActivateView):
-        server.register_view(view(test))
+    proxy = PairingProxy(registry, *proxy_config) if proxy_config is not None else None
+    test = _PairingRuntime(
+        registry, bytes.fromhex(admin_fingerprint), server.server_port, local_test=bool(local_test), proxy=proxy,
+    )
+    if local_test:
+        for view in (_ClaimView, _StatusView, _ActivateView):
+            server.register_view(view(test))
     for command in (_invite, _status, _approve, _cancel, _info, _revoke):
         websocket_api.async_register_command(hass, command)
+    if proxy is not None:
+        websocket_api.async_register_command(hass, _direct_access)
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, test.stop)
     hass.data[_RUNTIME_KEY] = test
     if "frontend" in hass.config.components:
