@@ -71,6 +71,7 @@ class _PairingRuntime:
         self.origin = validate_origin(f"https://{_LOOPBACK}:{port}") if local_test else None
         self.proxy = proxy
         self.http = PairingHttp(registry, local_source=self.local_source, origin=self.origin)
+        self.universal = False
 
     @property
     def native(self) -> NativePairingIngress | None:
@@ -102,6 +103,24 @@ class _PairingRuntime:
         if self.proxy is not None:
             await self.proxy.async_disable()
         await self.registry.async_discard_invitations()
+
+
+def _https_origins(hass) -> list[str]:
+    from homeassistant.helpers.network import NoURLAvailableError, get_url
+
+    origins = []
+    for options in (
+        {"allow_internal": False, "allow_cloud": False},
+        {"allow_external": False, "allow_cloud": False},
+        {"allow_internal": False, "require_cloud": True},
+    ):
+        try:
+            origin = validate_origin(get_url(hass, require_ssl=True, allow_ip=True, **options))
+        except (NoURLAvailableError, PairingError):
+            continue
+        if origin not in origins:
+            origins.append(origin)
+    return origins
 
 
 class _PairView(HomeAssistantView):
@@ -143,7 +162,7 @@ class _PanelModuleView(_PairView):
 
     async def get(self, request: web.Request) -> web.StreamResponse:
         # The native ES modules contain only static code and are fetched without a HA token.
-        if self.test.native is None and self.test.client_key(request) is None:
+        if not self.test.universal and self.test.native is None and self.test.client_key(request) is None:
             raise web.HTTPNotFound
         return web.FileResponse(
             Path(__file__).with_name(self.filename),
@@ -195,7 +214,9 @@ class _AdminOperation:
         self.authorized = False
         if self.test.active and self.user is not None and self.user.is_active and self.user.is_admin:
             request = current_request.get()
-            if self.test.native is None:
+            if self.test.universal:
+                self.authorized = request is not None and request.secure
+            elif self.test.native is None:
                 self.key = self.test.client_key(request)
                 self.authorized = self.key is not None
             else:
@@ -226,7 +247,11 @@ async def _invite(hass, connection, msg) -> None:
             return
         origin = validate_origin(origin)
         recipient = _recipient(msg.get("display_key"), operation.key)
-        if origin == operation.test.origin:
+        if operation.test.universal and origin in _https_origins(hass):
+            invitation = await operation.test.registry.async_invite(
+                administrator_id=operation.user.id, confirmed_origin=origin, direct=True,
+            )
+        elif origin == operation.test.origin:
             invitation = await operation.test.registry.async_invite(
                 administrator_id=operation.user.id, confirmed_origin=origin,
             )
@@ -339,6 +364,9 @@ async def _info(hass, connection, msg) -> None:
         result.update(direct_configured=True, direct_origin=operation.test.proxy.origin)
     if (native := operation.test.native) is not None:
         result["configured_origin"] = native.configured_origin
+    if operation.test.universal:
+        result["https_origins"] = origins = _https_origins(hass)
+        result["suggested_origin"] = origins[0] if origins else None
     operation.result(result)
 
 
@@ -391,7 +419,7 @@ async def _direct_access(hass, connection, msg) -> None:
 
 async def async_setup_local_pairing(
     hass: HomeAssistant, fingerprint: object, direct_options: object = None,
-    *, native_options: object = None,
+    *, native_options: object = None, universal: bool = False,
 ) -> None:
     """Prepare native administration and any explicitly configured access modes."""
     server = hass.http
@@ -420,7 +448,7 @@ async def async_setup_local_pairing(
             admin_fingerprint = admin
         except (OSError, PairingError, ValueError):
             _LOGGER.warning("Horéveil direct pairing is disabled: incompatible TLS configuration")
-    if admin_fingerprint is None and native_options is None:
+    if admin_fingerprint is None and native_options is None and not universal:
         return
     try:
         registry = await PairingRegistry.async_open(hass)
@@ -443,6 +471,26 @@ async def async_setup_local_pairing(
         registry, bytes.fromhex(admin_fingerprint) if admin_fingerprint is not None else None,
         server.server_port, local_test=bool(local_test), proxy=proxy,
     )
+    if universal:
+        from .pairing_signed import DIRECT_BASE, SignedPairingHttp
+
+        test.universal = True
+        test.http = SignedPairingHttp(registry)
+
+        class DirectView(_PairView):
+            def __init__(self, operation):
+                super().__init__(test)
+                self.operation = operation
+                self.url = f"{DIRECT_BASE}/{operation}"
+                self.name = f"api:horeveil:direct:{operation}"
+
+            async def post(self, request):
+                if self.operation == "claim":
+                    return await test.http.claim(request)
+                return await test.http.signed(request, self.operation)
+
+        for operation in ("claim", "enroll", "status", "activate", "cancel"):
+            server.register_view(DirectView(operation))
     if local_test or test.native is not None:
         for view in (_ClaimView, _StatusView, _ActivateView):
             server.register_view(view(test))

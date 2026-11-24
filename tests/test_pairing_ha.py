@@ -21,7 +21,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from test_pairing_protocol import comparison_code
-from test_receiver import current_request, is_cloud_request, pairing_ha_module, setup_domain
+from test_receiver import current_request, is_cloud_request, pairing_ha_module, pairing_signed_module, setup_domain
 
 _BASE = "/api/horeveil/v1/pair"
 _ORIGIN = "https://127.0.0.1:8123"
@@ -100,7 +100,8 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
             TemporaryDirectory(dir=Path(__file__).resolve().parents[1]),
         ))
         self.enterContext(patch.dict(
-            "sys.modules", {"custom_components.horeveil.pairing_ha": pairing_ha_module},
+            "sys.modules", {"custom_components.horeveil.pairing_ha": pairing_ha_module,
+                            "custom_components.horeveil.pairing_signed": pairing_signed_module},
         ))
         self.secret = token_bytes(32)
         self.payload = {
@@ -192,12 +193,13 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
     def auth(self, pairing_id):
         return {"X-Horeveil-Authorization": f"v1 {pairing_id}.{b64(self.secret)}"}
 
-    async def test_registration_refuses_default_and_unsafe_server(self):
+    async def test_default_only_registers_signed_routes_and_unsafe_legacy_is_disabled(self):
         hass = self.new_ha()
         await setup_domain(hass, {})
-        self.assertEqual(hass.views, {})
-        self.assertEqual(hass.ws_commands, {})
-        self.assertEqual(hass.panels, {})
+        self.assertIn("/api/horeveil/direct/v1/enroll", hass.views)
+        self.assertNotIn(f"{_BASE}/claim", hass.views)
+        self.assertEqual(len(hass.ws_commands), 6)
+        self.assertTrue(hass.panels["horeveil-association"]["require_admin"])
         for field, value in (
             ("server_host", ["0.0.0.0"]), ("server_host", ["127.0.0.1", "::"]),
             ("ssl_peer_certificate", None), ("context", None),

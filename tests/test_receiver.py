@@ -275,6 +275,7 @@ with patch.dict(
     from custom_components.horeveil import pairing as pairing_module
     from custom_components.horeveil import pairing_http as pairing_http_module
     from custom_components.horeveil import pairing_ha as pairing_ha_module
+    from custom_components.horeveil import pairing_signed as pairing_signed_module
     from custom_components.horeveil import async_setup as setup_domain
     from custom_components.horeveil import receiver as receiver_module
     from custom_components.horeveil.sensor import async_setup_entry as setup_sensors

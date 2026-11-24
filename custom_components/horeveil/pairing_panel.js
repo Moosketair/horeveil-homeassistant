@@ -26,13 +26,14 @@ const template = `
   </style>
   <main>
     <h1>Association Horéveil</h1>
-    <p id="notice" role="status">Chargement de la recette locale…</p>
+    <p id="notice" role="status">Chargement de l’association…</p>
     <div id="content" hidden>
       <section aria-labelledby="add-title">
         <h2 id="add-title">Ajouter un téléphone</h2>
         <form id="address">
           <label for="origin">Adresse HTTPS de Home Assistant</label>
-          <input id="origin" type="url" required autocomplete="off" spellcheck="false">
+          <input id="origin" type="url" required autocomplete="off" spellcheck="false" list="https-origins">
+          <datalist id="https-origins"></datalist>
           <p>Domaine ou hôte <output id="host" for="origin">—</output></p>
           <p class="muted">L’adresse Internet configurée dans HA est une suggestion. Son accessibilité depuis le téléphone n’est pas vérifiée.</p>
           <button id="local" type="button">Utiliser l’adresse de recette</button>
@@ -158,6 +159,7 @@ class HoreveilAssociation extends HTMLElement {
   #testOrigin;
   #directOrigin;
   #directConfigured = false;
+  #httpsOrigins;
   #configuredOrigin;
   #loaded = false;
   #invitation;
@@ -229,6 +231,8 @@ class HoreveilAssociation extends HTMLElement {
     this.#testOrigin = undefined;
     this.#directOrigin = undefined;
     this.#directConfigured = false;
+    this.#httpsOrigins = undefined;
+    this.#element("https-origins").replaceChildren();
     this.#configuredOrigin = undefined;
     this.#loaded = false;
     this.#element("direct-confirm").checked = false;
@@ -273,10 +277,13 @@ class HoreveilAssociation extends HTMLElement {
 
   #address() {
     const parsed = parseOrigin(this.#element("origin").value.trim());
-    const usable = parsed && [this.#testOrigin, this.#directOrigin].includes(parsed.origin);
+    const usable = parsed && (this.#httpsOrigins ?? [this.#testOrigin, this.#directOrigin]).includes(parsed.origin);
     this.#element("host").textContent = parsed?.host ?? "—";
     this.#element("availability").textContent = usable
       ? "Adresse autorisée pour créer une invitation. La joignabilité n’est pas vérifiée."
+      : this.#httpsOrigins
+        ? (this.#httpsOrigins.length ? "Choisissez une adresse HTTPS proposée par Home Assistant."
+          : "Home Assistant ne propose aucune adresse HTTPS pour le téléphone.")
       : this.#configuredOrigin
         ? `Confirmez l’adresse configurée pour le relais HTTPS (${this.#configuredOrigin}).`
       : "Choisissez une adresse de recette ou confirmez le relais HTTPS avant de créer une invitation.";
@@ -303,6 +310,12 @@ class HoreveilAssociation extends HTMLElement {
     this.#testOrigin = info.test_origin;
     this.#directOrigin = info.direct_origin;
     this.#directConfigured = info.direct_configured === true;
+    this.#httpsOrigins = info.https_origins;
+    this.#element("https-origins").replaceChildren(...(this.#httpsOrigins ?? []).map((origin) => {
+      const option = document.createElement("option");
+      option.value = origin;
+      return option;
+    }));
     this.#configuredOrigin = info.configured_origin;
     this.#element("content").hidden = false;
     this.#element("empty").hidden = info.phones.length > 0;
@@ -364,7 +377,7 @@ class HoreveilAssociation extends HTMLElement {
     this.#element("code").textContent = code;
     this.#element("expires").dateTime = invitation.expires_at;
     this.#element("expires").textContent = new Date(expiration).toLocaleString();
-    if (invitation.origin === this.#directOrigin) {
+    if (this.#httpsOrigins?.includes(invitation.origin) || invitation.origin === this.#directOrigin) {
       const drawn = drawInvitationQr(this.#element("qr-canvas"), invitation.origin, code, invitation.expires_at);
       this.#element("qr").hidden = !drawn;
     }
@@ -396,7 +409,7 @@ class HoreveilAssociation extends HTMLElement {
     const reviewing = state === "awaiting_approval";
     this.#element("invitation").hidden = !state;
     this.#element("manual").hidden = state !== "issued";
-    const direct = this.#invitation?.origin === this.#directOrigin;
+    const direct = this.#httpsOrigins?.includes(this.#invitation?.origin) || this.#invitation?.origin === this.#directOrigin;
     const qr = this.#element("qr");
     if (state !== "issued" || !direct) {
       const canvas = this.#element("qr-canvas");

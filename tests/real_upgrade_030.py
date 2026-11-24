@@ -67,8 +67,12 @@ async def phase(profile, upgrade):
         identity = sha256(json.dumps(dict(entry.data), sort_keys=True).encode()).hexdigest()
         hook = hass.data[_HANDLERS][entry.data["webhook_id"]]
         assert hook.local_only and hook.allowed_methods == frozenset({"POST"})
-        assert "horeveil.local_pairing_test" not in hass.data
-        assert not any(x.startswith("horeveil/pairing_test/") for x in hass.data["websocket_api"])
+        runtime = hass.data.get("horeveil.local_pairing_test")
+        if upgrade and runtime is not None:
+            assert runtime.universal and not await runtime.registry.async_list_active()
+        else:
+            assert runtime is None
+            assert not any(x.startswith("horeveil/pairing_test/") for x in hass.data["websocket_api"])
         body = before["body"] if upgrade else snapshot()
         if upgrade:
             assert entry.runtime_data.current.installation_id == body["installation_id"]

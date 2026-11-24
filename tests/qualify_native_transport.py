@@ -2,21 +2,24 @@
 
 import asyncio
 from argparse import ArgumentParser
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
+import json
 from secrets import token_bytes
 from shutil import copytree
 import ssl
 import subprocess
 from tempfile import TemporaryDirectory
 from time import monotonic
+from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
 from aiohttp import ClientConnectionError, ClientSession, TCPConnector, ThreadedResolver
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from homeassistant import bootstrap, loader
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant
@@ -108,6 +111,63 @@ async def exercise(client, origin, admin, guest, registry, through_proxy):
         await check_request(client, "GET", status, 401, headers=auth)
 
 
+async def exercise_signed(client, origin, admin, guest):
+    from http_message_signatures import HTTPMessageSigner, HTTPSignatureKeyResolver, algorithms
+
+    base = origin + "/api/horeveil/direct/v1/"
+    alias = ec.generate_private_key(ec.SECP256R1())
+
+    class Key(HTTPSignatureKeyResolver):
+        def resolve_private_key(self, key_id):
+            return alias
+
+    signer = HTTPMessageSigner(signature_algorithm=algorithms.ECDSA_P256_SHA256, key_resolver=Key())
+    await check_request(client, "POST", base + "status", 401, headers={"X-Horeveil-Relay-Secret": "invalid"})
+    await check_request(client, "POST", origin + _BASE + "/claim", 404)
+    async with client.ws_connect(origin + "/api/websocket") as ws:
+        assert await _authenticate(ws, guest["access_token"]) == "auth_ok"
+        assert not (await _pair(ws, "info"))["success"]
+    async with client.ws_connect(origin + "/api/websocket") as ws:
+        assert await _authenticate(ws, admin["access_token"]) == "auth_ok"
+        assert origin in (await _pair(ws, "info"))["result"]["https_origins"]
+        display = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        display_key = _b64(display.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo))
+        invite = (await _pair(ws, "invite", origin=origin, display_key=display_key))["result"]
+        code = _decode_code(invite["code_encrypted"], display)
+        secret = token_bytes(32)
+        claim = {"installation_id": str(uuid4()), "claim_id": str(uuid4()), "phone_label": "Qualification",
+                 "credential_digest": _b64(sha256(secret).digest())}
+        reply = await check_request(client, "POST", base + "claim", 200,
+                                    headers={"X-Horeveil-Invitation": code}, json=claim)
+        assert reply["profile"] == "signed-v1"
+        pairing_id, server_id = reply["pairing_id"], reply["server_id"]
+        approval = {"invitation_id": invite["invitation_id"], "pairing_id": pairing_id, "confirmed": True}
+        assert not (await _pair(ws, "approve", **approval))["success"]
+
+        def prepare(operation, body):
+            raw = json.dumps(body, separators=(",", ":")).encode()
+            message = SimpleNamespace(method="POST", url=base + operation, headers={
+                "Content-Type": "application/json", "Horeveil-Server-Id": server_id,
+                "X-Horeveil-Authorization": f"v1 {pairing_id}.{_b64(secret)}",
+            })
+            now = datetime.now(UTC)
+            signer.sign(message, key_id=pairing_id, created=now, expires=now + timedelta(seconds=120),
+                        nonce=str(uuid4()), label="sig1", tag=f"horeveil-{operation}-v1", body=raw,
+                        covered_component_ids=("@method", "@target-uri", "content-type", "content-digest", "horeveil-server-id"))
+            return {"data": raw, "headers": message.headers}
+
+        enrollment = {key: claim[key] for key in ("claim_id", "installation_id")}
+        enrollment.update(pairing_id=pairing_id, server_id=server_id, challenge=reply["challenge"], public_key_spki=_b64(
+            alias.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)))
+        await check_request(client, "POST", base + "enroll", 200, **prepare("enroll", enrollment))
+        assert (await _pair(ws, "approve", **approval))["success"]
+        activate = prepare("activate", {"confirmed": True})
+        assert (await check_request(client, "POST", base + "activate", 200, **activate))["state"] == "active"
+        await check_request(client, "POST", base + "activate", 401, **activate)
+        assert (await _pair(ws, "revoke", pairing_id=pairing_id, confirmed=True))["success"]
+        await check_request(client, "POST", base + "status", 401, **prepare("status", {}))
+
+
 async def relay_tcp(reader, writer, nginx_port):
     """Present a synthetic WAN socket address to Nginx using a test-only listener."""
     upstream_reader, upstream = await asyncio.open_connection("127.0.0.1", nginx_port)
@@ -129,7 +189,7 @@ async def relay_tcp(reader, writer, nginx_port):
         writer.close()
 
 
-async def run(profile, nginx, stock, through_proxy):
+async def run(profile, nginx, stock, through_proxy, signed):
     _certificate_files(profile, nginx=False)
     core_port, proxy_port = _free_port(), _free_port()
     backend = f"{'http' if through_proxy else 'https'}://127.0.0.1:{core_port}"
@@ -142,7 +202,6 @@ async def run(profile, nginx, stock, through_proxy):
     loader.async_setup(hass)
     process, relay = None, None
     try:
-        assert await bootstrap.async_from_config_dict(config, hass) is hass
         if through_proxy:
             relay = await asyncio.start_server(lambda r, w: relay_tcp(r, w, proxy_port), "127.0.0.1", 0)
             origin = f"https://127.0.0.1:{relay.sockets[0].getsockname()[1]}"
@@ -163,12 +222,15 @@ http {{ server {{ listen 127.0.0.1:{proxy_port} ssl proxy_protocol;
                                                            stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
         else:
             origin = backend
+        if signed:
+            config.update(homeassistant={"internal_url": origin}, frontend={})
+        assert await bootstrap.async_from_config_dict(config, hass) is hass
         await hass.async_start()
         flow = await hass.config_entries.flow.async_init(_DOMAIN, context={"source": "user"})
         assert (await hass.config_entries.flow.async_configure(flow["flow_id"], {}))["type"] == "create_entry"
         await hass.async_block_till_done()
         entry, = hass.config_entries.async_entries(_DOMAIN)
-        registry = await register_probe(hass, origin)
+        registry = None if signed else await register_probe(hass, origin)
         admin = await _token(hass, "Administrateur de qualification", origin, administrator=True)
         guest = await _token(hass, "Utilisateur de qualification", origin, administrator=False)
         tls = ssl.create_default_context(cafile=profile / "ca.pem")
@@ -176,16 +238,24 @@ http {{ server {{ listen 127.0.0.1:{proxy_port} ssl proxy_protocol;
             if through_proxy:
                 for _ in range(20):
                     try:
-                        await check_request(client, "GET", origin + _BASE + "/status", 401)
+                        if signed:
+                            await check_request(client, "POST", origin + "/api/horeveil/direct/v1/status", 401)
+                        else:
+                            await check_request(client, "GET", origin + _BASE + "/status", 401)
                         break
                     except ClientConnectionError:
                         await asyncio.sleep(0.1)
                 else:
                     raise RuntimeError("Nginx de qualification indisponible")
-                await check_request(client, "GET", backend + _BASE + "/status", 404)
-                await check_request(client, "GET", backend + _BASE + "/status", 400,
+                url = backend + ("/api/horeveil/direct/v1" if signed else _BASE) + "/status"
+                method = "POST" if signed else "GET"
+                await check_request(client, method, url, 404)
+                await check_request(client, method, url, 400,
                                     headers={"X-Forwarded-For": "127.0.0.1", "X-Forwarded-Proto": "https"})
-            await exercise(client, origin, admin, guest, registry, through_proxy)
+            if signed:
+                await exercise_signed(client, origin, admin, guest)
+            else:
+                await exercise(client, origin, admin, guest, registry, through_proxy)
             # A real synthetic webhook, with credentials from this disposable profile only.
             path = "/api/webhook/" + entry.data["webhook_id"]
             auth = {"X-Horeveil-Token": entry.data["relay_token"]}
@@ -211,10 +281,11 @@ if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--nginx", type=Path)
     parser.add_argument("--stock-proxy", type=Path)
+    parser.add_argument("--signed", action="store_true", help="Exercise the installed signed profile instead of the qualification probe")
     args = parser.parse_args()
     if bool(args.nginx) != bool(args.stock_proxy):
         parser.error("--nginx and --stock-proxy are required together")
     with TemporaryDirectory(prefix="horeveil-native-qualification-") as name:
         profile = Path(name)
         copytree(_ROOT / "custom_components" / _DOMAIN, profile / "custom_components" / _DOMAIN)
-        asyncio.run(run(profile, args.nginx, args.stock_proxy, bool(args.nginx)))
+        asyncio.run(run(profile, args.nginx, args.stock_proxy, bool(args.nginx), args.signed))

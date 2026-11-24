@@ -12,7 +12,7 @@ from ipaddress import ip_address
 import re
 from secrets import token_bytes
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -31,6 +31,9 @@ _ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _CODE = re.compile(rf"[0-7][{_ALPHABET}]{{25}}", re.ASCII)
 _COMPARISON_CODE = re.compile(rf"[{_ALPHABET}]{{8}}", re.ASCII)
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+type SignedOperation = Literal["enroll", "status", "activate", "cancel"]
+type Enrollment = tuple[bytes, UUID, UUID, str]
+type VerifySignature = Callable[[bytes, str, UUID], tuple[UUID, int, int]]
 
 
 class PairingError(ValueError):
@@ -47,6 +50,14 @@ class PairingConflict(PairingError):
 
 class PairingApprovalRequired(PairingError):
     """The authenticated claim is awaiting administrator approval."""
+
+
+class PairingRateLimited(PairingError):
+    """The bounded replay window cannot accept another nonce."""
+
+
+class PairingClockSkew(PairingError):
+    """An authenticated signature lies outside the permitted time window."""
 
 
 class PairingStatus(StrEnum):
@@ -99,6 +110,7 @@ class Association:
     ha_permissions: Permissions = Permissions()
     phone_permissions: Permissions = Permissions()
     credential_digest: bytes | None = field(default=None, repr=False)
+    public_key: bytes | None = field(default=None, repr=False)
 
     def as_storage(self) -> dict:
         return {
@@ -111,6 +123,7 @@ class Association:
             "credential_digest": (
                 self.credential_digest.hex() if self.credential_digest is not None else None
             ),
+            "public_key": self.public_key.hex() if self.public_key is not None else None,
         }
 
     @classmethod
@@ -122,17 +135,21 @@ class Association:
                 raise PairingError("Invalid stored credential")
             ha_permissions = Permissions.from_storage(data["ha_permissions"])
             phone_permissions = Permissions.from_storage(data["phone_permissions"])
+            key = bytes.fromhex(data["public_key"]) if data.get("public_key") is not None else None
+            if key is not None and len(key) != 91:
+                raise PairingError("Invalid stored public key")
         else:
             digest = None
+            key = None
             ha_permissions = phone_permissions = Permissions()
         return cls(
             UUID(data["pairing_id"]), UUID(data["installation_id"]),
-            validate_origin(data["origin"]), state, ha_permissions, phone_permissions, digest,
+            validate_origin(data["origin"]), state, ha_permissions, phone_permissions, digest, key,
         )
 
     def revoked(self) -> "Association":
         return replace(
-            self, state=AssociationState.REVOKED, credential_digest=None,
+            self, state=AssociationState.REVOKED, credential_digest=None, public_key=None,
             ha_permissions=Permissions(), phone_permissions=Permissions(),
         )
 
@@ -160,12 +177,18 @@ class PairingReservation:
     challenge: str
     claim: PairingClaim
     status: PairingStatus = PairingStatus.AWAITING_APPROVAL
+    public_key: bytes | None = field(default=None, repr=False)
 
-    def comparison_code(self) -> str:
+    def comparison_code(self, origin: str | None = None) -> str:
         message = (
             f"horeveil-pair-v1|{self.server_id}|{self.pairing_id}|"
             f"{self.claim.claim_id}|{self.challenge}"
         )
+        if self.public_key is not None:
+            fingerprint = urlsafe_b64encode(sha256(self.public_key).digest()).decode("ascii").rstrip("=")
+            message = "\n".join(("horeveil-direct-compare-v1", str(self.server_id), str(self.pairing_id),
+                                 str(self.claim.installation_id), str(self.claim.claim_id), self.challenge,
+                                 origin or "", fingerprint))
         output = hmac_digest(self.claim.credential_digest, message.encode("ascii"), "sha256")
         return _crockford(output[:5], 8)
 
@@ -186,6 +209,7 @@ class _PendingInvitation:
     deadline: float
     digest: bytes = field(repr=False)
     reservation: PairingReservation | None = None
+    direct: bool = False
 
 
 def validate_origin(candidate: str) -> str:
@@ -234,11 +258,25 @@ class _BackupExcludedStore(Store):
         return self.hass.config.path(self.key)
 
 
+async def _persist(write) -> None:
+    """Finish a storage operation before releasing the caller's lock."""
+    task = asyncio.create_task(write())
+    cancellation = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    task.result()
+    if cancellation is not None:
+        raise cancellation
+
+
 class PairingRegistry:
     """One registry per HA instance, created lazily by the future pairing flow."""
 
     def __init__(
-        self, store: Store, guard: Store, *, clock: Callable[[], float] = monotonic,
+        self, store: Store, guard: Store, *, clock: Callable[[], float] = monotonic, replay: Store | None = None,
     ) -> None:
         self._store = store
         self._guard = guard
@@ -248,6 +286,8 @@ class PairingRegistry:
         self._available = False
         self._associations: dict[UUID, Association] = {}
         self._invitations: dict[UUID, _PendingInvitation] = {}
+        self._replay = replay
+        self._replay_ready = False
 
     @classmethod
     async def async_open(cls, hass: HomeAssistant) -> "PairingRegistry":
@@ -258,6 +298,7 @@ class PairingRegistry:
             registry = cls(
                 Store(hass, 1, f"{DOMAIN}.pairings", **options),
                 _BackupExcludedStore(hass, 1, f".cache/{DOMAIN}.pairing_guard", **options),
+                replay=_BackupExcludedStore(hass, 1, f".cache/{DOMAIN}.pairing_replay", **options),
             )
             hass.data[_REGISTRY_KEY] = registry
         await registry.async_load()
@@ -284,6 +325,7 @@ class PairingRegistry:
                 generation = str(UUID(stored["generation"]))
                 associations = {}
                 installations = set()
+                enrolled_keys = set()
                 for raw in stored["associations"]:
                     association = Association.from_storage(raw)
                     if association.pairing_id in associations:
@@ -292,6 +334,10 @@ class PairingRegistry:
                         if association.installation_id in installations:
                             raise PairingError("Duplicate active installation")
                         installations.add(association.installation_id)
+                        if association.public_key is not None:
+                            if association.public_key in enrolled_keys:
+                                raise PairingError("Duplicate active key")
+                            enrolled_keys.add(association.public_key)
                     associations[association.pairing_id] = association
             except (AttributeError, KeyError, TypeError, ValueError):
                 raise PairingError("Invalid pairing registry") from None
@@ -325,23 +371,14 @@ class PairingRegistry:
             self._associations = associations
             self._available = True
 
-        task = asyncio.create_task(write())
-        cancellation = None
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError as error:
-                cancellation = error
-        task.result()
-        if cancellation is not None:
-            raise cancellation
+        await _persist(write)
 
     def _prune_expired(self, now: float) -> None:
         self._invitations = {
             key: pending for key, pending in self._invitations.items() if pending.deadline > now
         }
 
-    async def async_invite(self, *, administrator_id: str, confirmed_origin: str) -> Invitation:
+    async def async_invite(self, *, administrator_id: str, confirmed_origin: str, direct: bool = False) -> Invitation:
         """Issue one temporary code for the administrator and confirmed origin."""
         origin = validate_origin(confirmed_origin)
         async with self._lock:
@@ -356,7 +393,7 @@ class PairingRegistry:
             invitation_id = uuid4()
             code = _crockford(token_bytes(16), 26)
             self._invitations[invitation_id] = _PendingInvitation(
-                administrator_id, origin, now + _TTL.total_seconds(), sha256(code.encode()).digest(),
+                administrator_id, origin, now + _TTL.total_seconds(), sha256(code.encode()).digest(), direct=direct,
             )
             return Invitation(invitation_id, origin, datetime.now(UTC) + _TTL, code)
 
@@ -379,7 +416,7 @@ class PairingRegistry:
             }
 
     async def async_claim(
-        self, code: str, claim: PairingClaim, *, origin: str | None = None,
+        self, code: str, claim: PairingClaim, *, origin: str | None = None, direct: bool = False,
     ) -> PairingReservation:
         """Reserve an invitation or return the same reservation on an exact retry."""
         digest = _invitation_digest(code)
@@ -389,7 +426,8 @@ class PairingRegistry:
             server_id = self.server_id
             self._prune_expired(self._clock())
             for invitation_id, pending in self._invitations.items():
-                if (origin is not None and pending.origin != origin) or not compare_digest(pending.digest, digest):
+                if (pending.direct != direct or (origin is not None and pending.origin != origin)
+                        or not compare_digest(pending.digest, digest)):
                     continue
                 reservation = pending.reservation
                 if reservation is not None:
@@ -437,11 +475,11 @@ class PairingRegistry:
             if pending is None or pending.administrator_id != administrator_id:
                 raise InvalidPairingCredential("Invitation unavailable")
             reservation = pending.reservation
-            if reservation is None:
+            if reservation is None or (pending.direct and reservation.public_key is None):
                 return None
             return PairingReview(
                 reservation.pairing_id, pending.origin, reservation.status,
-                reservation.claim.phone_label, reservation.comparison_code(),
+                reservation.claim.phone_label, reservation.comparison_code(pending.origin),
             )
 
     async def async_approve_claim(
@@ -453,8 +491,10 @@ class PairingRegistry:
             invitation_id, pending, reservation = self._find_reservation(pairing_id)
             if pending.administrator_id != administrator_id:
                 raise PermissionError("Invitation owner required")
+            if pending.direct and reservation.public_key is None:
+                raise InvalidPairingCredential("Key enrollment required")
             if not _COMPARISON_CODE.fullmatch(comparison_code) or not compare_digest(
-                reservation.comparison_code(), comparison_code,
+                reservation.comparison_code(pending.origin), comparison_code,
             ):
                 raise InvalidPairingCredential("Comparison code mismatch")
             self._invitations[invitation_id] = replace(
@@ -474,7 +514,7 @@ class PairingRegistry:
             if active is not None and (origin is None or active.origin == origin):
                 return PairingStatus.ACTIVE
             invitation_id, pending, reservation = self._find_reservation(pairing_id)
-            if (origin is not None and pending.origin != origin) or not compare_digest(
+            if pending.direct or (origin is not None and pending.origin != origin) or not compare_digest(
                 reservation.claim.credential_digest, digest,
             ):
                 raise InvalidPairingCredential("Invalid pairing credential")
@@ -486,6 +526,87 @@ class PairingRegistry:
                 invitation_id, pending, pairing_id, reservation.claim.installation_id, digest,
             )
             return PairingStatus.ACTIVE
+
+    async def _consume_nonce(self, pairing_id: UUID, nonce: UUID, deadline: int, now: int) -> None:
+        """Reserve before mutation while holding the registry lock."""
+        store = self._replay
+        if store is None:
+            raise PairingError("Replay protection unavailable")
+        saved = await store.async_load()
+        if saved is None:
+            if self._replay_ready or any(assoc.public_key is not None for assoc in self._associations.values()):
+                raise PairingError("Replay state unavailable")
+            saved = {"server_id": str(self.server_id), "time": now, "nonces": {}}
+        try:
+            floor = saved["time"]
+            if saved["server_id"] != str(self.server_id) or type(floor) is not int or now < floor:
+                raise PairingError("Replay clock unavailable")
+            items = saved["nonces"]
+            if not isinstance(items, dict) or len(items) > 4096 or any(type(value) is not int for value in items.values()):
+                raise PairingError("Invalid replay state")
+        except (KeyError, TypeError):
+            raise PairingError("Invalid replay state") from None
+        prefix = f"{pairing_id}/"
+        identifier = prefix + str(nonce)
+        live = {key: value for key, value in items.items() if value >= now}
+        if identifier in live:
+            raise InvalidPairingCredential("Signature already used")
+        if len(live) >= 4096 or sum(key.startswith(prefix) for key in live) >= 64:
+            raise PairingRateLimited("Signature limit reached")
+        live[identifier] = deadline
+        next_value = {"server_id": str(self.server_id), "time": now, "nonces": live}
+        # A failed or uncertain write must never be followed by activation.
+        async def write():
+            self._replay_ready = True
+            await store.async_save(next_value)
+            if await store.async_load() != next_value:
+                raise PairingError("Unable to persist replay state")
+
+        await _persist(write)
+
+    async def async_direct_request(
+        self, pairing_id: UUID, secret: bytes, operation: SignedOperation, verify: VerifySignature,
+        *, enrollment: Enrollment | None = None,
+    ) -> PairingStatus:
+        """Bind enrollment, signed confirmation and revocation under one lock."""
+        if len(secret) != 32 or operation not in {"enroll", "status", "activate", "cancel"}:
+            raise InvalidPairingCredential("Invalid pairing credential")
+        digest = sha256(secret).digest()
+        async with self._lock:
+            server_id = self.server_id
+            active = self._associations.get(pairing_id)
+            if active is not None:
+                if (active.public_key is None or active.credential_digest is None
+                        or not compare_digest(active.credential_digest, digest) or operation not in {"status", "activate"}):
+                    raise InvalidPairingCredential("Pairing unavailable")
+                await self._consume_nonce(pairing_id, *verify(active.public_key, active.origin, server_id))
+                return PairingStatus.ACTIVE
+            invitation_id, pending, reservation = self._find_reservation(pairing_id)
+            claim = reservation.claim
+            if not pending.direct or not compare_digest(claim.credential_digest, digest):
+                raise InvalidPairingCredential("Pairing unavailable")
+            key = reservation.public_key
+            if operation == "enroll":
+                if enrollment is None:
+                    raise InvalidPairingCredential("Enrollment required")
+                proposed, claim_id, installation_id, challenge = enrollment
+                if (claim_id != claim.claim_id or installation_id != claim.installation_id
+                        or challenge != reservation.challenge or (key is not None and key != proposed)):
+                    raise InvalidPairingCredential("Invalid enrollment")
+                key = proposed
+            if key is None:
+                raise InvalidPairingCredential("Enrollment required")
+            await self._consume_nonce(pairing_id, *verify(key, pending.origin, server_id))
+            if operation == "enroll":
+                self._invitations[invitation_id] = replace(pending, reservation=replace(reservation, public_key=key))
+            elif operation == "activate":
+                if reservation.status is not PairingStatus.APPROVED:
+                    raise PairingApprovalRequired("Administrator approval required")
+                await self._activate(invitation_id, pending, pairing_id, claim.installation_id, digest, public_key=key)
+                return PairingStatus.ACTIVE
+            elif operation == "cancel":
+                del self._invitations[invitation_id]
+            return reservation.status
 
     async def async_activate_confirmed(
         self, invitation_id: UUID, code: str, *, installation_id: UUID,
@@ -504,7 +625,7 @@ class PairingRegistry:
             pending = self._invitations.get(invitation_id)
             if (
                 pending is None or pending.administrator_id != administrator_id
-                or pending.reservation is not None or not compare_digest(pending.digest, digest)
+                or pending.direct or pending.reservation is not None or not compare_digest(pending.digest, digest)
             ):
                 raise PairingError("Invalid invitation")
             if self._installation_reserved(installation_id):
@@ -527,14 +648,16 @@ class PairingRegistry:
 
     async def _activate(
         self, invitation_id: UUID, pending: _PendingInvitation, pairing_id: UUID,
-        installation_id: UUID, credential_digest: bytes,
+        installation_id: UUID, credential_digest: bytes, *, public_key: bytes | None = None,
     ) -> Association:
         if self._installation_active(installation_id):
             raise PairingConflict("Installation already paired")
+        if public_key is not None and any(association.public_key == public_key for association in self._associations.values()):
+            raise PairingConflict("Key already paired")
         server_id = self.server_id
         association = Association(
             pairing_id, installation_id, pending.origin, AssociationState.ACTIVE,
-            credential_digest=credential_digest,
+            credential_digest=credential_digest, public_key=public_key,
         )
         del self._invitations[invitation_id]
         await self._commit(server_id, {**self._associations, pairing_id: association})
@@ -544,6 +667,7 @@ class PairingRegistry:
         association = self._associations.get(pairing_id) if self._available else None
         if (
             association is not None and association.state is AssociationState.ACTIVE
+            and association.public_key is None
             and association.credential_digest is not None
             and compare_digest(association.credential_digest, digest)
         ):

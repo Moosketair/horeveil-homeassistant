@@ -1,5 +1,6 @@
 """Unregistered HTTP handlers for the direct pairing protocol."""
 
+import asyncio
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Awaitable, Callable
 from ipaddress import IPv4Address, IPv6Address
@@ -15,10 +16,12 @@ from homeassistant.exceptions import HomeAssistantError
 from .pairing import (
     InvalidPairingCredential,
     PairingApprovalRequired,
+    PairingClockSkew,
     PairingClaim,
     PairingConflict,
     PairingError,
     PairingRegistry,
+    PairingRateLimited,
 )
 
 _INVITATION_HEADER = "X-Horeveil-Invitation"
@@ -87,20 +90,25 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-async def _json_body(request: web.Request, fields: set[str]) -> dict:
+async def _read_json(request: web.Request, fields: set[str]) -> tuple[dict, bytes]:
     if request.content_type != "application/json" or "Content-Encoding" in request.headers:
         raise _InvalidRequest
     if request.content_length is not None and request.content_length > _MAX_BODY:
         raise _BodyTooLarge
     body = bytearray()
-    async for chunk in request.content.iter_chunked(_MAX_BODY + 1):
-        if len(body) + len(chunk) > _MAX_BODY:
-            raise _BodyTooLarge
-        body.extend(chunk)
+    async with asyncio.timeout(5):
+        async for chunk in request.content.iter_chunked(_MAX_BODY + 1):
+            if len(body) + len(chunk) > _MAX_BODY:
+                raise _BodyTooLarge
+            body.extend(chunk)
     payload = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object)
     if not isinstance(payload, dict) or payload.keys() != fields:
         raise _InvalidRequest
-    return payload
+    return payload, bytes(body)
+
+
+async def _json_body(request: web.Request, fields: set[str]) -> dict:
+    return (await _read_json(request, fields))[0]
 
 
 def _response(payload: dict, status: int = 200, *, retry_after: int | None = None) -> web.Response:
@@ -124,10 +132,12 @@ class PairingHttp:
         local_source: Callable[[web.Request], Source | None] | None = None,
         clock: Callable[[], float] = monotonic,
         origin: str | None = None,
+        direct: bool = False,
     ) -> None:
         self._registry = registry
         self._local_source = local_source
         self._origin = origin
+        self._direct = direct
         self._clock = clock
         self._window_end = 0.0
         self._total = 0
@@ -167,6 +177,12 @@ class PairingHttp:
             return _response({"error": "pairing_conflict"}, 409)
         except PairingApprovalRequired:
             return _response({"error": "approval_required"}, 403)
+        except PairingRateLimited:
+            return _response({"error": "rate_limited"}, 429, retry_after=30)
+        except PairingClockSkew:
+            return _response({"error": "signature_clock"}, 422)
+        except TimeoutError:
+            return _response({"error": "invalid_request"}, 408)
         except (HomeAssistantError, PairingError, OSError):
             return _response({"error": "pairing_unavailable"}, 503)
         except _BodyTooLarge:
@@ -197,14 +213,17 @@ class PairingHttp:
                 _uuid(payload["claim_id"]), _uuid(payload["installation_id"]),
                 label, _decode_32(payload["credential_digest"]),
             ),
-            origin=self._origin,
+            origin=self._origin, direct=self._direct,
         )
-        return {
+        result = {
             "pairing_id": str(reservation.pairing_id),
             "server_id": str(reservation.server_id),
             "challenge": reservation.challenge,
             "state": reservation.status.value,
         }
+        if self._direct:
+            result["profile"] = "signed-v1"
+        return result
 
     async def _status(self, request: web.Request) -> dict:
         pairing_id, secret = _credential(request)

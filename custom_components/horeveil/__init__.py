@@ -28,6 +28,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             hass, options.get("local_pairing_test_client_sha256"), options.get("direct_pairing"),
             native_options=options.get("native_pairing"),
         )
+    elif "frontend" in getattr(getattr(hass, "config", None), "components", ()):
+        from .pairing_ha import async_setup_local_pairing
+
+        await async_setup_local_pairing(hass, None, universal=True)
     return True
 
 
