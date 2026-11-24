@@ -262,7 +262,10 @@ with patch.dict(
         "hass_nabucasa": fake_module(
             "hass_nabucasa", remote=SimpleNamespace(is_cloud_request=is_cloud_request),
         ),
-        "probatio": fake_module("probatio", Optional=lambda name: name),
+        "probatio": fake_module(
+            "probatio", Optional=lambda name: name, Any=lambda *choices: choices,
+            Schema=lambda _schema, **_options: dict, ALLOW_EXTRA=object(),
+        ),
     },
 ):
     from custom_components.horeveil import async_remove_entry, async_setup_entry, async_unload_entry

@@ -88,6 +88,10 @@ Les [événements de sonnerie et de commandes réelles](docs/EVENEMENTS_TEMPS_RE
 4. Sur une entrée de recette, envoyez un snapshot synthétique avec une date `expires_at` proche et suspendez les envois. Après cette échéance, vérifiez que le calendrier est indisponible et que l’action `calendar.get_events` ne renvoie rien pour la période testée. Vérifiez le même état après redémarrage, puis la récupération à la réception d’une révision fraîche.
 5. Avec deux réveils proches, vérifiez le prochain réveil et le compteur dans les entités Horéveil. Laissez passer le premier début sonore et vérifiez que les deux capteurs évoluent sans nouvel envoi. Après un redémarrage et après expiration, vérifiez que la dernière réception affiche toujours le même horodatage.
 
+## Appairage direct de recette
+
+Le [guide Supervised et Nginx Proxy Manager](docs/APPAIRAGE_DIRECT_3C4B7.md) décrit le mode natif optionnel et les vérifications avant activation.
+
 ## Tests Python ciblés
 
 Résultat local sous Python 3.13.14 et aiohttp 3.14.5 — 30 tests réussis, dont les 25 scénarios existants.

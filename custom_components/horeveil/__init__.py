@@ -1,5 +1,7 @@
 """Receive Horéveil snapshots over a local Home Assistant webhook."""
 
+import probatio
+
 from homeassistant.components import webhook
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -13,16 +15,18 @@ from .receiver import SnapshotReceiver
 type HoreveilConfigEntry = ConfigEntry[SnapshotReceiver]
 
 PLATFORMS = (Platform.CALENDAR, Platform.SENSOR)
+CONFIG_SCHEMA = probatio.Schema({probatio.Optional(DOMAIN): probatio.Any(None, dict)}, extra=probatio.ALLOW_EXTRA)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up optional pairing access separately from the receiver entries."""
     options = config.get(DOMAIN)
-    if isinstance(options, dict) and {"local_pairing_test_client_sha256", "direct_pairing"} & options.keys():
+    if isinstance(options, dict) and {"local_pairing_test_client_sha256", "direct_pairing", "native_pairing"} & options.keys():
         from .pairing_ha import async_setup_local_pairing
 
         await async_setup_local_pairing(
             hass, options.get("local_pairing_test_client_sha256"), options.get("direct_pairing"),
+            native_options=options.get("native_pairing"),
         )
     return True
 

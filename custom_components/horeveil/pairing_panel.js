@@ -158,6 +158,7 @@ class HoreveilAssociation extends HTMLElement {
   #testOrigin;
   #directOrigin;
   #directConfigured = false;
+  #configuredOrigin;
   #loaded = false;
   #invitation;
   #timer;
@@ -228,13 +229,14 @@ class HoreveilAssociation extends HTMLElement {
     this.#testOrigin = undefined;
     this.#directOrigin = undefined;
     this.#directConfigured = false;
+    this.#configuredOrigin = undefined;
     this.#loaded = false;
     this.#element("direct-confirm").checked = false;
     this.#dropInvitation();
     this.#element("content").hidden = true;
     this.#element("origin").value = "";
     this.#element("phones").replaceChildren();
-    this.#notice("Accès réservé à un administrateur en mode de recette locale.");
+    this.#notice("Accès réservé à un administrateur connecté en HTTPS.");
   }
 
   #dropInvitation() {
@@ -275,6 +277,8 @@ class HoreveilAssociation extends HTMLElement {
     this.#element("host").textContent = parsed?.host ?? "—";
     this.#element("availability").textContent = usable
       ? "Adresse autorisée pour créer une invitation. La joignabilité n’est pas vérifiée."
+      : this.#configuredOrigin
+        ? `Confirmez l’adresse configurée pour le relais HTTPS (${this.#configuredOrigin}).`
       : "Choisissez une adresse de recette ou confirmez le relais HTTPS avant de créer une invitation.";
     this.#element("local").hidden = !this.#testOrigin;
     this.#element("direct").hidden = !this.#directConfigured;
@@ -285,6 +289,7 @@ class HoreveilAssociation extends HTMLElement {
     this.#element("direct-confirm-label").hidden = Boolean(this.#directOrigin);
     this.#element("direct-toggle").disabled = this.#busy || (!this.#directOrigin && (
       !parsed || parsed.origin === this.#testOrigin || !this.#element("direct-confirm").checked
+      || (this.#configuredOrigin && parsed.origin !== this.#configuredOrigin)
     ));
     this.#element("create").disabled = !usable || this.#busy || Boolean(this.#invitation);
     return usable ? parsed.origin : null;
@@ -293,11 +298,12 @@ class HoreveilAssociation extends HTMLElement {
   async #load(generation) {
     const info = await this.#call("info");
     if (generation !== this.#generation) return;
-    if (!this.#loaded) this.#element("origin").value = info.suggested_origin ?? "";
+    if (!this.#loaded) this.#element("origin").value = info.configured_origin ?? info.suggested_origin ?? "";
     this.#loaded = true;
     this.#testOrigin = info.test_origin;
     this.#directOrigin = info.direct_origin;
     this.#directConfigured = info.direct_configured === true;
+    this.#configuredOrigin = info.configured_origin;
     this.#element("content").hidden = false;
     this.#element("empty").hidden = info.phones.length > 0;
     this.#element("phones").replaceChildren(...info.phones.map((id) => {

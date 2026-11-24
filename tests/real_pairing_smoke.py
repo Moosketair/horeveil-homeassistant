@@ -469,7 +469,7 @@ async def _test_browser_qr(hass, panel, profile, origin):
     await expect(panel.locator("#direct-state")).to_have_text("Accès direct désactivé")
 
 
-async def _test_browser(hass, profile, origin, admin, channel, component, direct_origin=None):
+async def _test_browser(hass, profile, origin, admin, channel, component, direct_origin=None, *, native=False):
     from playwright.async_api import async_playwright, expect
 
     flow = await hass.config_entries.flow.async_init(_DOMAIN, context={"source": "user"})
@@ -489,7 +489,7 @@ async def _test_browser(hass, profile, origin, admin, channel, component, direct
                 channel=channel, args=["--ignore-certificate-errors"],
             )
             context = await browser.new_context(
-                client_certificates=[{
+                client_certificates=[] if native else [{
                     "origin": origin,
                     "certPath": profile / "client.pem",
                     "keyPath": profile / "client.key",
@@ -535,11 +535,14 @@ async def _test_browser(hass, profile, origin, admin, channel, component, direct
                     link = page.locator(f'ha-config-entry-row ha-icon-button[href^="/{_PANEL}?"]').first
                     await link.click(timeout=15_000)
                 panel = page.locator(_PANEL)
-                await expect(panel.locator("#origin")).to_have_value(_SUGGESTED)
-                await expect(panel.locator("#host")).to_have_text("recette.example.invalid")
+                initial_origin = direct_origin if native else _SUGGESTED
+                await expect(panel.locator("#origin")).to_have_value(initial_origin)
+                await expect(panel.locator("#host")).to_have_text(initial_origin.removeprefix("https://"))
                 await expect(panel.locator("#create")).to_be_disabled()
                 if direct_origin:
                     await _test_browser_qr(hass, panel, profile, direct_origin)
+                if native:
+                    return
                 await panel.locator("#origin").fill(origin)
                 await expect(panel.locator("#create")).to_be_enabled()
                 await expect(panel.locator("input[value=read]")).to_be_checked()

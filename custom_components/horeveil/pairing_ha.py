@@ -1,4 +1,4 @@
-"""Native HA wiring for an explicitly enabled, isolated pairing test."""
+"""Home Assistant administration and pairing views."""
 
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from ipaddress import IPv4Address
@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 import re
 import ssl
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from aiohttp import web
@@ -27,6 +28,7 @@ from homeassistant.exceptions import HomeAssistantError
 from .const import DOMAIN
 from .pairing import InvalidPairingCredential, PairingError, PairingRegistry, validate_origin
 from .pairing_http import PairingHttp
+from .pairing_native import NativePairingIngress
 from .pairing_proxy import PAIRING_BASE, FINGERPRINT, PairingProxy, build_proxy_tls, direct_tls, pinned_certificate
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,8 +62,8 @@ def _supports_admin_tls(server) -> bool:
 
 class _PairingRuntime:
     def __init__(
-        self, registry: PairingRegistry, fingerprint: bytes, port: int, *,
-        local_test: bool, proxy: PairingProxy | None,
+        self, registry: PairingRegistry, fingerprint: bytes | None, port: int, *,
+        local_test: bool, proxy: PairingProxy | NativePairingIngress | None,
     ) -> None:
         self.registry = registry
         self.active = True
@@ -70,9 +72,18 @@ class _PairingRuntime:
         self.proxy = proxy
         self.http = PairingHttp(registry, local_source=self.local_source, origin=self.origin)
 
+    @property
+    def native(self) -> NativePairingIngress | None:
+        return self.proxy if isinstance(self.proxy, NativePairingIngress) else None
+
+    @property
+    def phone_http(self) -> PairingHttp:
+        native = self.native
+        return native.http if native is not None else self.http
+
     def client_key(self, request: web.Request | None) -> rsa.RSAPublicKey | None:
         """Authenticate the direct loopback socket and its pinned client certificate."""
-        if not self.active or remote.is_cloud_request.get():
+        if not self.active or self.fingerprint is None or remote.is_cloud_request.get():
             return None
         tls = direct_tls(request)
         if tls is None or (certificate := pinned_certificate(tls, self.fingerprint)) is None:
@@ -106,7 +117,7 @@ class _ClaimView(_PairView):
     name = "api:horeveil:pair:claim"
 
     async def post(self, request: web.Request) -> web.Response:
-        return await self.test.http.claim(request)
+        return await self.test.phone_http.claim(request)
 
 
 class _StatusView(_PairView):
@@ -114,7 +125,7 @@ class _StatusView(_PairView):
     name = "api:horeveil:pair:status"
 
     async def get(self, request: web.Request) -> web.Response:
-        return await self.test.http.status(request)
+        return await self.test.phone_http.status(request)
 
 
 class _ActivateView(_PairView):
@@ -122,7 +133,7 @@ class _ActivateView(_PairView):
     name = "api:horeveil:pair:activate"
 
     async def post(self, request: web.Request) -> web.Response:
-        return await self.test.http.activate(request)
+        return await self.test.phone_http.activate(request)
 
 
 class _PanelModuleView(_PairView):
@@ -131,7 +142,8 @@ class _PanelModuleView(_PairView):
     filename = "pairing_panel.js"
 
     async def get(self, request: web.Request) -> web.StreamResponse:
-        if self.test.client_key(request) is None:
+        # The native ES modules contain only static code and are fetched without a HA token.
+        if self.test.native is None and self.test.client_key(request) is None:
             raise web.HTTPNotFound
         return web.FileResponse(
             Path(__file__).with_name(self.filename),
@@ -159,9 +171,9 @@ def _seal(key: rsa.RSAPublicKey, value: str) -> str:
     return urlsafe_b64encode(key.encrypt(value.encode("ascii"), _OAEP)).decode("ascii").rstrip("=")
 
 
-def _recipient(value: object, client_key: rsa.RSAPublicKey) -> rsa.RSAPublicKey:
+def _recipient(value: object, client_key: rsa.RSAPublicKey | None) -> rsa.RSAPublicKey:
     """Use the browser's ephemeral public key, or the original CLI certificate."""
-    if value is None:
+    if value is None and client_key is not None:
         return client_key
     if not isinstance(value, str) or not _PUBLIC_KEY.fullmatch(value):
         raise ValueError
@@ -172,7 +184,7 @@ def _recipient(value: object, client_key: rsa.RSAPublicKey) -> rsa.RSAPublicKey:
 
 
 class _AdminOperation:
-    """Share the same local gate across the native administrator commands."""
+    """Require an active HA administrator and the transport policy for this mode."""
 
     def __init__(self, hass, connection, msg) -> None:
         self.test = hass.data[_RUNTIME_KEY]
@@ -180,10 +192,16 @@ class _AdminOperation:
         self.msg_id = msg["id"]
         self.user = connection.user
         self.key = None
-        if self.user is not None and self.user.is_active and self.user.is_admin:
-            self.key = self.test.client_key(current_request.get())
-        if self.key is None:
-            self.connection.send_error(self.msg_id, "unauthorized", "Local administrator mTLS required")
+        self.authorized = False
+        if self.test.active and self.user is not None and self.user.is_active and self.user.is_admin:
+            request = current_request.get()
+            if self.test.native is None:
+                self.key = self.test.client_key(request)
+                self.authorized = self.key is not None
+            else:
+                self.authorized = request is not None and request.secure and not remote.is_cloud_request.get()
+        if not self.authorized:
+            self.connection.send_error(self.msg_id, "unauthorized", "Secure administrator session required")
 
     def result(self, data: dict) -> None:
         self.connection.send_result(self.msg_id, data)
@@ -199,7 +217,7 @@ class _AdminOperation:
 @websocket_api.async_response
 async def _invite(hass, connection, msg) -> None:
     operation = _AdminOperation(hass, connection, msg)
-    if operation.key is None:
+    if not operation.authorized:
         return
     try:
         origin = msg.get("origin")
@@ -234,7 +252,7 @@ async def _invite(hass, connection, msg) -> None:
 @websocket_api.async_response
 async def _status(hass, connection, msg) -> None:
     operation = _AdminOperation(hass, connection, msg)
-    if operation.key is None:
+    if not operation.authorized:
         return
     try:
         recipient = _recipient(msg.get("display_key"), operation.key)
@@ -260,7 +278,7 @@ async def _status(hass, connection, msg) -> None:
 @websocket_api.async_response
 async def _approve(hass, connection, msg) -> None:
     operation = _AdminOperation(hass, connection, msg)
-    if operation.key is None:
+    if not operation.authorized:
         return
     try:
         pairing_id = _uuid(msg.get("pairing_id"))
@@ -282,7 +300,7 @@ async def _approve(hass, connection, msg) -> None:
 @websocket_api.async_response
 async def _cancel(hass, connection, msg) -> None:
     operation = _AdminOperation(hass, connection, msg)
-    if operation.key is None:
+    if not operation.authorized:
         return
     try:
         if await operation.test.registry.async_cancel(
@@ -300,7 +318,7 @@ async def _cancel(hass, connection, msg) -> None:
 @websocket_api.async_response
 async def _info(hass, connection, msg) -> None:
     operation = _AdminOperation(hass, connection, msg)
-    if operation.key is None:
+    if not operation.authorized:
         return
     configured_url = hass.config.external_url
     try:
@@ -319,6 +337,8 @@ async def _info(hass, connection, msg) -> None:
     }
     if operation.test.proxy is not None:
         result.update(direct_configured=True, direct_origin=operation.test.proxy.origin)
+    if (native := operation.test.native) is not None:
+        result["configured_origin"] = native.configured_origin
     operation.result(result)
 
 
@@ -327,7 +347,7 @@ async def _info(hass, connection, msg) -> None:
 @websocket_api.async_response
 async def _revoke(hass, connection, msg) -> None:
     operation = _AdminOperation(hass, connection, msg)
-    if operation.key is None:
+    if not operation.authorized:
         return
     try:
         if msg.get("confirmed") is not True:
@@ -350,7 +370,7 @@ async def _revoke(hass, connection, msg) -> None:
 @websocket_api.async_response
 async def _direct_access(hass, connection, msg) -> None:
     operation = _AdminOperation(hass, connection, msg)
-    if operation.key is None:
+    if not operation.authorized:
         return
     proxy = operation.test.proxy
     if proxy is None or msg.get("confirmed") is not True:
@@ -371,6 +391,7 @@ async def _direct_access(hass, connection, msg) -> None:
 
 async def async_setup_local_pairing(
     hass: HomeAssistant, fingerprint: object, direct_options: object = None,
+    *, native_options: object = None,
 ) -> None:
     """Prepare native administration and any explicitly configured access modes."""
     server = hass.http
@@ -378,6 +399,9 @@ async def async_setup_local_pairing(
     if fingerprint is not None and not local_test:
         _LOGGER.warning("Horéveil local pairing test is disabled: incompatible HTTP configuration")
     if _RUNTIME_KEY in hass.data:
+        return
+    if native_options is not None and (fingerprint is not None or direct_options is not None):
+        _LOGGER.warning("Horéveil pairing is disabled: choose one transport configuration")
         return
     proxy_config = None
     admin_fingerprint = fingerprint if local_test else None
@@ -396,7 +420,7 @@ async def async_setup_local_pairing(
             admin_fingerprint = admin
         except (OSError, PairingError, ValueError):
             _LOGGER.warning("Horéveil direct pairing is disabled: incompatible TLS configuration")
-    if admin_fingerprint is None:
+    if admin_fingerprint is None and native_options is None:
         return
     try:
         registry = await PairingRegistry.async_open(hass)
@@ -406,10 +430,20 @@ async def async_setup_local_pairing(
     if _RUNTIME_KEY in hass.data:
         return
     proxy = PairingProxy(registry, *proxy_config) if proxy_config is not None else None
+    if native_options is not None:
+        try:
+            proxy = NativePairingIngress(registry, server, native_options)
+            external = hass.config.external_url
+            if external and urlsplit(external).hostname == urlsplit(proxy.configured_origin).hostname:
+                raise PairingError("The relay must have its own DNS name")
+        except (PairingError, ValueError):
+            _LOGGER.warning("Horéveil native pairing is disabled: incompatible proxy configuration")
+            return
     test = _PairingRuntime(
-        registry, bytes.fromhex(admin_fingerprint), server.server_port, local_test=bool(local_test), proxy=proxy,
+        registry, bytes.fromhex(admin_fingerprint) if admin_fingerprint is not None else None,
+        server.server_port, local_test=bool(local_test), proxy=proxy,
     )
-    if local_test:
+    if local_test or test.native is not None:
         for view in (_ClaimView, _StatusView, _ActivateView):
             server.register_view(view(test))
     for command in (_invite, _status, _approve, _cancel, _info, _revoke):
