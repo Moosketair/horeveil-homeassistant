@@ -1,3 +1,5 @@
+import { qrcodegen } from "./pairing-qrcode.js";
+
 const COMMAND = "horeveil/pairing_test/";
 
 const template = `
@@ -16,6 +18,8 @@ const template = `
     button:disabled { opacity:.55; cursor:default; }
     output, code, li { overflow-wrap:anywhere; }
     #code, #comparison { font-size:1.15rem; letter-spacing:.08em; }
+    #qr { margin:16px 0; }
+    #qr-canvas { display:block; width:min(100%, 320px); height:auto; image-rendering:pixelated; }
     fieldset { margin:12px 0; border:1px solid var(--divider-color); }
     .muted { color:var(--secondary-text-color); }
     [hidden] { display:none !important; }
@@ -35,7 +39,6 @@ const template = `
           <button id="create" type="submit" disabled>Confirmer et créer l’invitation</button>
         </form>
         <p id="availability"></p>
-        <p class="muted">QR indisponible tant que le parcours Android n’a pas été qualifié.</p>
         <div id="direct" hidden>
           <p id="direct-state"></p>
           <label id="direct-confirm-label"><input id="direct-confirm" type="checkbox">
@@ -45,11 +48,19 @@ const template = `
         </div>
         <div id="invitation" hidden>
           <p>État <strong id="state"></strong></p>
-          <p>Expiration <time id="expires"></time></p>
-          <p id="manual">Adresse <output id="invitation-origin"></output><br>Code manuel <code id="code"></code></p>
+          <p>Valable 5 minutes. Expiration <time id="expires"></time></p>
+          <div id="manual">
+            <p>Adresse <output id="invitation-origin"></output><br>Code manuel <code id="code"></code></p>
+            <figure id="qr" hidden>
+              <canvas id="qr-canvas" width="0" height="0" aria-label="QR temporaire d’association Horéveil"></canvas>
+              <figcaption>Scannez depuis Horéveil Android. La joignabilité HTTPS depuis le téléphone reste à vérifier.</figcaption>
+            </figure>
+            <p id="qr-unavailable" class="muted">La recette sur la boucle locale utilise le code manuel avec un simulateur sur cet hôte.</p>
+            <button id="regenerate" type="button">Régénérer l’invitation</button>
+          </div>
           <div id="review" hidden>
             <p>Code de sécurité <code id="comparison"></code></p>
-            <label><input id="compared" type="checkbox"> J’ai comparé le code avec celui du simulateur.</label>
+            <label><input id="compared" type="checkbox"> J’ai comparé le code avec celui affiché sur l’appareil.</label>
             <button id="approve" type="button" disabled>Approuver</button>
           </div>
           <button id="cancel" type="button">Annuler l’invitation</button>
@@ -97,6 +108,27 @@ function parseOrigin(value) {
   }
 }
 
+function drawInvitationQr(canvas, origin, code, expiresAt) {
+  const data = JSON.stringify({ v: 1, origin, code, expires_at: expiresAt });
+  const qr = qrcodegen.QrCode.encodeText(data, qrcodegen.QrCode.Ecc.MEDIUM);
+  const scale = 8;
+  const quietZone = 4;
+  canvas.width = canvas.height = (qr.size + 2 * quietZone) * scale;
+  const context = canvas.getContext("2d");
+  if (!context) return false;
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = "#000";
+  for (let y = 0; y < qr.size; y += 1) {
+    for (let x = 0; x < qr.size; x += 1) {
+      if (qr.getModule(x, y)) {
+        context.fillRect((x + quietZone) * scale, (y + quietZone) * scale, scale, scale);
+      }
+    }
+  }
+  return true;
+}
+
 function base64url(bytes) {
   return btoa(String.fromCharCode(...new Uint8Array(bytes)))
     .replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
@@ -129,6 +161,7 @@ class HoreveilAssociation extends HTMLElement {
   #loaded = false;
   #invitation;
   #timer;
+  #expiryTimer;
 
   constructor() {
     super();
@@ -151,6 +184,7 @@ class HoreveilAssociation extends HTMLElement {
     this.#element("compared").onchange = () => this.#invitationState();
     this.#element("approve").onclick = () => this.#decide(true);
     this.#element("cancel").onclick = () => this.#decide(false);
+    this.#element("regenerate").onclick = () => this.#regenerate();
     this.#element("refresh").onclick = () => this.#run((generation) => this.#load(generation));
     this.#element("content").addEventListener("change", (event) => {
       if (event.target.name !== "mode") return;
@@ -204,6 +238,7 @@ class HoreveilAssociation extends HTMLElement {
   }
 
   #dropInvitation() {
+    clearTimeout(this.#expiryTimer);
     this.#invitation = undefined;
     this.#element("code").textContent = "";
     this.#element("comparison").textContent = "";
@@ -298,20 +333,56 @@ class HoreveilAssociation extends HTMLElement {
   #create() {
     const origin = this.#address();
     if (!origin || this.#invitation) return;
+    this.#run((generation) => this.#issue(origin, generation),
+      "Impossible de créer l’invitation. Une invitation peut déjà être ouverte.");
+  }
+
+  async #issue(origin, generation) {
+    const key = await newDisplayKey();
+    if (generation !== this.#generation) return;
+    const result = await this.#call("invite", { origin, display_key: key.publicKey });
+    if (generation !== this.#generation) return;
+    const code = await decrypt(key.privateKey, result.code_encrypted);
+    if (generation !== this.#generation) return;
+    const expiration = Date.parse(result.expires_at);
+    if (!Number.isFinite(expiration) || expiration <= Date.now()) {
+      this.#notice("Invitation expirée.");
+      return;
+    }
+    const invitation = {
+      invitation_id: result.invitation_id, origin: result.origin, expires_at: result.expires_at,
+      key, state: "issued",
+    };
+    this.#invitation = invitation;
+    this.#element("invitation-origin").textContent = invitation.origin;
+    this.#element("code").textContent = code;
+    this.#element("expires").dateTime = invitation.expires_at;
+    this.#element("expires").textContent = new Date(expiration).toLocaleString();
+    if (invitation.origin === this.#directOrigin) {
+      const drawn = drawInvitationQr(this.#element("qr-canvas"), invitation.origin, code, invitation.expires_at);
+      this.#element("qr").hidden = !drawn;
+    }
+    this.#expiryTimer = setTimeout(
+      () => this.#expire(invitation), Math.max(0, Math.min(300_000, expiration - Date.now())),
+    );
+    this.#notice("");
+  }
+
+  #regenerate() {
+    const invitation = this.#invitation;
+    if (invitation?.state !== "issued") return;
     this.#run(async (generation) => {
-      const key = await newDisplayKey();
+      await this.#call("cancel", { invitation_id: invitation.invitation_id });
       if (generation !== this.#generation) return;
-      const result = await this.#call("invite", { origin, display_key: key.publicKey });
-      if (generation !== this.#generation) return;
-      const code = await decrypt(key.privateKey, result.code_encrypted);
-      if (generation !== this.#generation) return;
-      this.#invitation = { ...result, key, state: "issued" };
-      this.#element("invitation-origin").textContent = result.origin;
-      this.#element("code").textContent = code;
-      this.#element("expires").dateTime = result.expires_at;
-      this.#element("expires").textContent = new Date(result.expires_at).toLocaleString();
-      this.#notice("");
-    }, "Impossible de créer l’invitation. Une invitation peut déjà être ouverte.");
+      this.#dropInvitation();
+      await this.#issue(invitation.origin, generation);
+    }, "Impossible de régénérer l’invitation.");
+  }
+
+  #expire(invitation) {
+    if (this.#invitation !== invitation) return;
+    this.#dropInvitation();
+    this.#notice("Invitation expirée.");
   }
 
   #invitationState() {
@@ -319,10 +390,23 @@ class HoreveilAssociation extends HTMLElement {
     const reviewing = state === "awaiting_approval";
     this.#element("invitation").hidden = !state;
     this.#element("manual").hidden = state !== "issued";
+    const direct = this.#invitation?.origin === this.#directOrigin;
+    const qr = this.#element("qr");
+    if (state !== "issued" || !direct) {
+      const canvas = this.#element("qr-canvas");
+      canvas.width = canvas.height = 0;
+      qr.hidden = true;
+    }
+    const qrUnavailable = this.#element("qr-unavailable");
+    qrUnavailable.hidden = !qr.hidden;
+    qrUnavailable.textContent = direct
+      ? "QR indisponible. Utilisez la saisie manuelle."
+      : "La recette sur la boucle locale utilise le code manuel avec un simulateur sur cet hôte.";
+    this.#element("regenerate").disabled = this.#busy;
     this.#element("review").hidden = !reviewing;
     this.#element("state").textContent = {
       issued: "En attente de demande", awaiting_approval: "À vérifier",
-      approved: "Approuvée, en attente de confirmation du simulateur",
+      approved: "Approuvée, en attente de confirmation du client",
     }[state] ?? "";
     this.#element("cancel").textContent = reviewing ? "Refuser la demande" : "Annuler l’invitation";
     this.#element("cancel").disabled = this.#busy;
@@ -334,8 +418,7 @@ class HoreveilAssociation extends HTMLElement {
     const invitation = this.#invitation;
     if (!invitation) return;
     if (Date.now() >= Date.parse(invitation.expires_at)) {
-      this.#dropInvitation();
-      this.#notice("Invitation expirée.");
+      this.#expire(invitation);
       return;
     }
     this.#run(async (generation) => {

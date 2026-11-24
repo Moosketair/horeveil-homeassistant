@@ -128,14 +128,21 @@ class _ActivateView(_PairView):
 class _PanelModuleView(_PairView):
     url = _PANEL_MODULE
     name = "api:horeveil:pair:panel"
+    filename = "pairing_panel.js"
 
     async def get(self, request: web.Request) -> web.StreamResponse:
         if self.test.client_key(request) is None:
             raise web.HTTPNotFound
         return web.FileResponse(
-            Path(__file__).with_name("pairing_panel.js"),
+            Path(__file__).with_name(self.filename),
             headers={"Cache-Control": "no-store", "Content-Type": "text/javascript"},
         )
+
+
+class _QrModuleView(_PanelModuleView):
+    url = "/api/horeveil/pairing-qrcode.js"
+    name = "api:horeveil:pair:qrcode"
+    filename = "pairing_qrcode.js"
 
 
 def _uuid(value: object) -> UUID:
@@ -413,6 +420,7 @@ async def async_setup_local_pairing(
     hass.data[_RUNTIME_KEY] = test
     if "frontend" in hass.config.components:
         server.register_view(_PanelModuleView(test))
+        server.register_view(_QrModuleView(test))
         await async_register_panel(
             hass, frontend_url_path=_PANEL, webcomponent_name=_PANEL,
             sidebar_title="Horéveil", sidebar_icon="mdi:alarm",

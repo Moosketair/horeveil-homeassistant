@@ -327,6 +327,21 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
             (await self.ws("revoke", pairing_id=str(uuid4()), confirmed=True))["error"], "unauthorized",
         )
 
+    async def test_qr_module_requires_the_pinned_local_connection(self):
+        await self.start()
+        url = self.server.make_url("/api/horeveil/pairing-qrcode.js")
+        async with ClientSession(connector=TCPConnector(ssl=self.other_tls)) as client:
+            self.assertEqual((await client.get(url)).status, 404)
+        self.cloud = True
+        self.assertEqual((await self.client.get(url)).status, 404)
+        self.cloud = False
+        async with self.client.get(url) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertIn("export { qrcodegen };", await response.text())
+        self.user = SimpleNamespace(is_admin=False, is_active=True, id="other")
+        self.assertEqual((await self.ws("invite", origin=_ORIGIN))["error"], "unauthorized")
+
     async def test_browser_key_and_admin_can_revoke_one_phone(self):
         await self.start()
         key = self.other_key

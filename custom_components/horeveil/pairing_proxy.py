@@ -122,8 +122,13 @@ class PairingProxy:
             address = ip_address(host)
         except ValueError:
             address = None
-        if address is not None and (address.is_loopback or address.is_unspecified or address.is_link_local):
-            raise PairingError("Use the HTTPS gateway origin")
+        if address is not None:
+            effective = getattr(address, "ipv4_mapped", None) or address
+            if effective.is_loopback or effective.is_unspecified or effective.is_link_local:
+                raise PairingError("Use the HTTPS gateway origin")
+        elif "." in host and not host.rsplit(".", 1)[1][0].isalpha():
+            # java.net.URI#getHost rejects a numeric-leading final DNS label.
+            raise PairingError("Use a gateway origin compatible with Android")
         async with self._lock:
             if self.origin == origin:
                 return origin

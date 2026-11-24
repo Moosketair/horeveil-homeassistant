@@ -2,11 +2,13 @@
 
 import asyncio
 from argparse import ArgumentParser
-from base64 import urlsafe_b64decode, urlsafe_b64encode
+from base64 import b64decode, urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import digest
+from io import BytesIO
 from ipaddress import IPv4Address
+import json
 import os
 from pathlib import Path
 from secrets import token_bytes
@@ -246,7 +248,7 @@ class _LoopbackResolver(AbstractResolver):
         pass
 
 
-async def _test_proxy(hass, profile, origin, public, backend_port, nginx, admin, guest):
+async def _test_proxy(hass, profile, origin, public, backend_port, nginx, admin, guest, browser_test=None):
     port = int(public.rsplit(":", 1)[1])
     template = (_ROOT / "docs" / "nginx-horeveil-pairing.conf").read_text("utf-8")
     vhost = template.replace("listen 443 ssl;", f"listen 127.0.0.1:{port} ssl;").replace(
@@ -302,6 +304,7 @@ async def _test_proxy(hass, profile, origin, public, backend_port, nginx, admin,
                         assert response.status == 421
                     for path in (
                         "/api/webhook/test", "/api/websocket", "/api/horeveil/v1/calendar/snapshot",
+                        "/api/horeveil/pairing-qrcode.js",
                         _BASE + "/status?unexpected=1",
                     ):
                         async with phone.get(public + path, allow_redirects=False) as response:
@@ -369,10 +372,101 @@ async def _test_proxy(hass, profile, origin, public, backend_port, nginx, admin,
                     assert (await _pair(ws, "direct_access", enabled=False, confirmed=True))["success"]
                     async with phone.get(test_url + "/status") as response:
                         assert response.status == 404
+        print("Nginx réel : TLS, opt-in, en-têtes, association et révocation OK.", flush=True)
+        if browser_test is not None:
+            await browser_test()
     finally:
         if process.returncode is None:
             process.terminate()
             await process.wait()
+
+
+async def _browser_qr(panel, origin):
+    import zxingcpp
+    from PIL import Image
+
+    canvas = panel.locator("#qr-canvas")
+    png = b64decode((await canvas.evaluate("(canvas) => canvas.toDataURL()")).partition(",")[2])
+    qr = zxingcpp.read_barcode(Image.open(BytesIO(png)), formats=zxingcpp.BarcodeFormat.QRCode)
+    assert qr is not None
+    payload = json.loads(qr.text)
+    manual_code = await panel.locator("#code").text_content()
+    expiration = await panel.locator("#expires").get_attribute("datetime")
+    assert await panel.locator("#invitation-origin").text_content() == origin
+    assert type(payload["v"]) is int
+    assert payload == {"v": 1, "origin": origin, "code": manual_code, "expires_at": expiration}
+    assert 280 < (datetime.fromisoformat(expiration) - datetime.now(UTC)).total_seconds() <= 300
+    classpath = os.environ.get("HOREVEIL_ANDROID_QR_CLASSPATH")
+    if classpath:
+        java = os.environ.get("HOREVEIL_ANDROID_QR_JAVA", "java")
+        process = await asyncio.create_subprocess_exec(
+            java, "-classpath", classpath, "fr.moosketair.horeveil.platform.homeassistant.AndroidPairingQrProbeKt",
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        await process.communicate(png)
+        assert process.returncode == 0, "ZXing Java or the Android parser rejected the QR"
+    return payload["code"]
+
+
+async def _test_browser_qr(hass, panel, profile, origin):
+    from playwright.async_api import expect
+
+    await panel.locator("#origin").fill(origin)
+    await expect(panel.locator("#host")).to_have_text(origin.removeprefix("https://"))
+    await expect(panel.locator("#direct-toggle")).to_be_disabled()
+    await panel.locator("#direct-confirm").check()
+    await panel.locator("#direct-toggle").click()
+    await expect(panel.locator("#direct-state")).to_contain_text(origin)
+    await expect(panel.locator("#create")).to_be_enabled()
+    await panel.locator("#create").click()
+    await expect(panel.locator("#qr")).to_be_visible()
+    original = await _browser_qr(panel, origin)
+    await panel.locator("#regenerate").click()
+    await expect(panel.locator("#regenerate")).to_be_enabled()
+    replacement = await _browser_qr(panel, origin)
+    assert original != replacement
+    secret = token_bytes(32)
+    claim = {
+        "claim_id": str(uuid4()), "installation_id": str(uuid4()), "phone_label": "Recette QR",
+        "credential_digest": _b64(sha256(secret).digest()),
+    }
+    tls = ssl.create_default_context(cafile=profile / "ca.pem")
+    async with ClientSession(connector=TCPConnector(ssl=tls, resolver=_LoopbackResolver())) as phone:
+        async def send(code):
+            return await phone.post(
+                origin + _BASE + "/claim", headers={"X-Horeveil-Invitation": code}, json=claim,
+            )
+
+        async with await send(original) as response:
+            assert response.status == 401
+        await panel.locator("#cancel").click()
+        await expect(panel.locator("#notice")).to_have_text("Invitation annulée.")
+        await expect(panel.locator("#qr")).to_be_hidden()
+        assert await panel.locator("#qr-canvas").evaluate("(canvas) => canvas.width") == 0
+        async with await send(replacement) as response:
+            assert response.status == 401
+        await panel.locator("#create").click()
+        await expect(panel.locator("#qr")).to_be_visible()
+        expired = await _browser_qr(panel, origin)
+        registry = hass.data["horeveil.local_pairing_test"].registry
+        with patch.object(registry, "_clock", lambda: monotonic() + 300):
+            async with await send(expired) as response:
+                assert response.status == 401
+            await expect(panel.locator("#qr")).to_be_hidden()
+        assert await panel.locator("#qr-canvas").evaluate("(canvas) => canvas.width") == 0
+        await panel.locator("#create").click()
+        await expect(panel.locator("#qr")).to_be_visible()
+        code = await _browser_qr(panel, origin)
+        async with await send(code) as response:
+            assert response.status == 200
+        await expect(panel.locator("#review")).to_be_visible()
+        await expect(panel.locator("#approve")).to_be_disabled()
+        await expect(panel.locator("#qr")).to_be_hidden()
+        assert await panel.locator("#qr-canvas").evaluate("(canvas) => canvas.width") == 0
+        await panel.locator("#cancel").click()
+        await expect(panel.locator("#notice")).to_have_text("Invitation annulée.")
+    await panel.locator("#direct-toggle").click()
+    await expect(panel.locator("#direct-state")).to_have_text("Accès direct désactivé")
 
 
 async def _test_browser(hass, profile, origin, admin, channel, component, direct_origin=None):
@@ -445,25 +539,20 @@ async def _test_browser(hass, profile, origin, admin, channel, component, direct
                 await expect(panel.locator("#host")).to_have_text("recette.example.invalid")
                 await expect(panel.locator("#create")).to_be_disabled()
                 if direct_origin:
-                    await panel.locator("#origin").fill(direct_origin)
-                    await expect(panel.locator("#direct-toggle")).to_be_disabled()
-                    await panel.locator("#direct-confirm").check()
-                    await panel.locator("#direct-toggle").click()
-                    await expect(panel.locator("#direct-state")).to_contain_text(direct_origin)
-                    await expect(panel.locator("#create")).to_be_enabled()
-                    await panel.locator("#direct-toggle").click()
-                    await expect(panel.locator("#direct-state")).to_have_text("Accès direct désactivé")
+                    await _test_browser_qr(hass, panel, profile, direct_origin)
                 await panel.locator("#origin").fill(origin)
                 await expect(panel.locator("#create")).to_be_enabled()
                 await expect(panel.locator("input[value=read]")).to_be_checked()
                 assert await panel.locator("fieldset input:checked").count() == 0
-                assert await panel.locator("ha-qr-code, canvas").count() == 0
+                await expect(panel.locator("#qr")).to_be_hidden()
+                assert await panel.locator("#qr-canvas").evaluate("(canvas) => canvas.width") == 0
 
                 async def create():
                     await panel.locator("#create").click()
                     await expect(panel.locator("#manual")).to_be_visible()
 
                 await create()
+                await expect(panel.locator("#qr-unavailable")).to_be_visible()
                 await panel.locator("#cancel").click()
                 await expect(panel.locator("#notice")).to_have_text("Invitation annulée.")
                 await create()
@@ -551,13 +640,22 @@ async def main(browser, channel, component, nginx):
             guest = await _token(hass, "Utilisateur de recette", origin, administrator=False)
             await _test_api(hass, profile, origin, admin, guest)
             print("Core natif : panneau, authentification, invitations, origine, permissions et révocation OK.", flush=True)
-            if nginx:
-                await _test_proxy(hass, profile, origin, direct_origin, backend_port, nginx, admin, guest)
-                print("Nginx réel : TLS, opt-in, en-têtes, association et révocation OK.", flush=True)
-            if browser:
+            async def run_browser():
                 await _test_browser(hass, profile, origin, admin, channel, component, direct_origin if nginx else None)
                 path = "composant monté avec la session HA réelle" if component else "ouverture depuis la fiche Horéveil"
                 print(f"Frontend HA et navigateur : {path}, association et révocation OK.")
+                if nginx:
+                    print("QR décodé dans Chrome, régénération, annulation, expiration et réservation via Nginx OK.")
+                    if os.environ.get("HOREVEIL_ANDROID_QR_CLASSPATH"):
+                        print("Le parseur du commit Android a accepté le QR décodé par ZXing Java.")
+
+            if nginx:
+                await _test_proxy(
+                    hass, profile, origin, direct_origin, backend_port, nginx, admin, guest,
+                    browser_test=run_browser if browser else None,
+                )
+            elif browser:
+                await run_browser()
         finally:
             await hass.async_stop(force=True)
 
