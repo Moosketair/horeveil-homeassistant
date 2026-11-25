@@ -26,7 +26,7 @@ Un retrait hors connexion prend effet côté Home Assistant à la prochaine livr
 
 ## Recette Home Assistant Container et Galaxy S25+
 
-1. Sauvegarder la configuration Home Assistant et relever les cinq identifiants d’entité Horéveil. Dans Dockge, identifier le volume monté dans `/config` par le conteneur Home Assistant. Remplacer seulement le dossier `custom_components/horeveil` par celui de cette branche, puis redémarrer Core. Conserver l’entrée existante et vérifier ses cinq entités et son dernier instantané frais.
+1. Dans **Paramètres → Système → Sauvegardes**, créer une sauvegarde manuelle incluant Home Assistant, la conserver hors du serveur et garder la clé de secours si elle est chiffrée. Relever les cinq identifiants d’entité Horéveil. Depuis HACS, ouvrir **Horéveil → ⋮ → Retélécharger → Besoin d’une autre version ?**, choisir **0.4.0-beta.1**, puis redémarrer Home Assistant. Conserver l’entrée existante et vérifier ses cinq entités, son dernier instantané frais et le webhook avant de changer de source.
 2. Installer l’APK Debug avec le même certificat que l’application existante. Utiliser une adresse HTTPS déjà configurée dans HA, accessible depuis le téléphone et reconnue par le système. Vérifier l’accès depuis le LAN puis le réseau mobile ou le VPN selon le trajet habituel. Une installation uniquement HTTP doit disposer d’un trajet HTTPS avant cette recette.
 3. Ouvrir **Horéveil** dans Home Assistant, sélectionner l’adresse et générer un QR. Sur Android, ouvrir **Réglages → Intégrations → Home Assistant**, scanner ou saisir l’invitation et comparer les codes. Approuver dans Home Assistant puis confirmer sur Android. Vérifier que le partage est initialement désactivé.
 4. Dans **Synchronisation du calendrier** du panneau, sélectionner le téléphone pour l’entrée existante. Activer le partage sur Android, choisir une seule alarme de recette puis utiliser **Synchroniser maintenant**. Vérifier la date de réception, l’alarme dans le calendrier et les capteurs. Ajouter une deuxième alarme, modifier puis supprimer une occurrence et vérifier la synchronisation automatique. Retirer tous les consentements et vérifier le calendrier vide.
@@ -37,6 +37,8 @@ Un retrait hors connexion prend effet côté Home Assistant à la prochaine livr
 ### Retour arrière
 
 Pour revenir au webhook avec ce code, révoquer ou désactiver le partage direct puis choisir **Webhook local** sur l’entrée. Demander un envoi local valide et vérifier les entités avant tout retour à l’ancien composant. Un Store dont la projection a été effacée doit être repeuplé avec un instantané webhook compatible avant de réinstaller la version 0.3.0, ou restauré depuis la sauvegarde cohérente prise avant l’essai. Les réglages webhook d’Android restent disponibles.
+
+Pour revenir à **0.3.0** depuis HACS, choisir `main` dans **Retélécharger → Besoin d’une autre version ?**, puis redémarrer Home Assistant. Si ce choix est indisponible ou si le webhook ne peut pas repeupler la projection, restaurer la sauvegarde préalable depuis Home Assistant. Une restauration complète revient aussi sur les autres changements effectués depuis cette sauvegarde.
 
 ## Vérifications du 25 novembre 2026
 
