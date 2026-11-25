@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from http_message_signatures import HTTPMessageSigner, HTTPSignatureKeyResolver, algorithms
 
 from test_pairing_protocol import b64
-from test_receiver import DiskStore, pairing_module, pairing_signed_module
+from test_receiver import DiskStore, pairing_module, pairing_signed_module, receiver_module
 
 ORIGIN = "https://ha.example"
 DIRECT_BASE = pairing_signed_module.DIRECT_BASE
@@ -49,7 +49,8 @@ def signed_headers(key, origin, operation, pairing_id, server_id, secret, body, 
 class SignedPairingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         directory = self.enterContext(TemporaryDirectory(dir=Path(__file__).resolve().parents[1]))
-        self.hass = SimpleNamespace(directory=Path(directory))
+        self.hass = SimpleNamespace(directory=Path(directory), is_stopping=False, listeners={},
+                                    async_add_executor_job=asyncio.to_thread, async_create_task=asyncio.create_task)
         self.key = ec.generate_private_key(ec.SECP256R1())
         self.secret = token_bytes(32)
         self.admin = SimpleNamespace(id="test", is_admin=True, is_active=True)
@@ -64,12 +65,17 @@ class SignedPairingTests(unittest.IsolatedAsyncioTestCase):
         self.registry = pairing_module.PairingRegistry(*stores[:2], replay=stores[2], clock=lambda: self.monotonic)
         await self.registry.async_load()
         self.http = SignedPairingHttp(self.registry)
+        self.calendar_store = DiskStore(self.hass, 1, "calendar")
+        self.receiver = receiver_module.SnapshotReceiver(self.hass, self.calendar_store, "test", "test")
+        await self.receiver.async_restore()
 
     async def dispatch(self, request):
         request = request.clone(scheme="https")
         operation = request.match_info["operation"]
         if operation == "claim":
             return await self.http.claim(request)
+        if operation == "calendar":
+            return await self.http.calendar(request, self.hass, lambda _: self.receiver)
         return await self.http.signed(request, operation)
 
     async def reserve(self, *, direct=True):
@@ -103,6 +109,87 @@ class SignedPairingTests(unittest.IsolatedAsyncioTestCase):
     async def approve(self, invitation):
         review = await self.registry.async_review_claim(self.admin, invitation.invitation_id)
         await self.registry.async_approve_claim(self.admin, review.pairing_id, review.comparison_code)
+
+    async def activate_calendar_phone(self):
+        invitation, data, reply = await self.reserve()
+        await self.send("enroll", self.prepare("enroll", reply, self.enroll_body(data, reply)), 200)
+        await self.approve(invitation)
+        await self.send("activate", self.prepare("activate", reply, {"confirmed": True}), 200)
+        return data["installation_id"], reply
+
+    def calendar_payload(self, installation_id, revision=1):
+        now = datetime.now(UTC)
+        return {
+            "schema_version": 1, "event": "calendar_snapshot", "installation_id": installation_id,
+            "revision": revision, "generated_at": now.isoformat(), "window_start": now.isoformat(),
+            "window_end_exclusive": (now + timedelta(days=30)).isoformat(), "timezone": "UTC",
+            "expires_at": (now + timedelta(hours=1)).isoformat(), "occurrences": [], "alarms": {},
+        }
+
+    async def test_calendar_source_signature_duplicate_and_restart(self):
+        installation, reply = await self.activate_calendar_phone()
+        pairing_id = UUID(reply["pairing_id"])
+        payload = self.calendar_payload(installation)
+
+        async def publish(status, data=payload):
+            return await self.send("calendar", self.prepare("calendar", reply, data), status)
+
+        self.assertEqual((await publish(403))["result"], "source_not_authorized")
+        await self.registry.async_select_calendar_source(pairing_id, self.receiver.async_select_source)
+        self.assertEqual((await publish(403, self.calendar_payload(str(uuid4()))))["result"], "different_installation")
+        body, headers = self.prepare("calendar", reply, payload)
+        await self.send("calendar", (body + b" ", headers), 401)
+        self.assertEqual((await self.send("calendar", (body, headers), 200))["result"], "accepted")
+        self.assertEqual((await self.calendar_store.async_load())["snapshot"], body.decode())
+        await self.restart()
+        self.assertEqual(self.receiver.direct_source, pairing_id)
+        await self.send("calendar", (body, headers), 401)
+        self.assertEqual((await publish(200))["result"], "duplicate")
+        self.assertEqual(self.calendar_store.writes, 0)
+        await self.registry.async_select_calendar_source(None, self.receiver.async_select_source)
+        self.assertIsNone(self.receiver.current)
+        await self.registry.async_select_calendar_source(pairing_id, self.receiver.async_select_source)
+        self.assertEqual((await publish(409))["result"], "old_revision")
+        self.assertEqual((await publish(200, payload | {"revision": 2}))["result"], "accepted")
+
+    async def test_calendar_acknowledgment_and_revocation_wait_for_storage(self):
+        installation, reply = await self.activate_calendar_phone()
+        pairing_id = UUID(reply["pairing_id"])
+        payload = self.calendar_payload(installation)
+        await self.registry.async_select_calendar_source(pairing_id, self.receiver.async_select_source)
+        self.calendar_store.fail = True
+        self.assertEqual(
+            (await self.send("calendar", self.prepare("calendar", reply, payload), 503))["result"], "storage_unavailable"
+        )
+        self.assertIsNone(self.receiver.current)
+        self.calendar_store.fail = False
+        entered, release = asyncio.Event(), asyncio.Event()
+        save = self.calendar_store.async_save
+
+        async def blocked_save(data):
+            entered.set()
+            await release.wait()
+            await save(data)
+
+        self.calendar_store.async_save = blocked_save
+        publish = asyncio.create_task(self.send("calendar", self.prepare("calendar", reply, payload), 200))
+        await asyncio.wait_for(entered.wait(), 5)
+
+        async def purge(source):
+            self.assertTrue(await self.receiver.async_select_source(None, forget=source))
+
+        revoke = asyncio.create_task(self.registry.async_revoke(pairing_id, purge=purge))
+        await asyncio.sleep(0)
+        self.assertFalse(publish.done())
+        self.assertFalse(revoke.done())
+        release.set()
+        self.assertEqual((await publish)["result"], "accepted")
+        self.assertTrue(await revoke)
+        self.assertIsNone((await self.calendar_store.async_load())["snapshot"])
+        self.assertIsNone(self.receiver.current)
+        await self.restart()
+        await self.send("calendar", self.prepare("calendar", reply, payload), 401)
+        self.assertEqual(self.receiver.direct_source, pairing_id)
 
     async def test_end_to_end_requires_same_key_and_replay_survives_restart(self):
         invitation, data, reply = await self.reserve()

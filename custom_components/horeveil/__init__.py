@@ -9,7 +9,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers.storage import Store
 
-from .const import DOMAIN, RELAY_TOKEN, WEBHOOK_ID
+from .const import CALENDAR_RECEIVERS, DOMAIN, PAIRING_RUNTIME, RELAY_TOKEN, WEBHOOK_ID
 from .receiver import SnapshotReceiver
 
 type HoreveilConfigEntry = ConfigEntry[SnapshotReceiver]
@@ -49,6 +49,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: HoreveilConfigEntry) -> 
             hass, _store(hass, entry), entry.data[RELAY_TOKEN], entry.entry_id
         )
         await receiver.async_restore()
+        data = getattr(hass, "data", None)
+        if receiver.direct_source is not None:
+            runtime = data.get(PAIRING_RUNTIME) if data is not None else None
+            if runtime is None or not runtime.universal:
+                raise ConfigEntryError("Unable to verify the Horéveil calendar source")
+            await runtime.registry.async_prepare_calendar_receiver(
+                receiver.direct_source, lambda source: receiver.async_select_source(None, forget=source)
+            )
         webhook.async_register(
             hass, DOMAIN, "Horéveil", entry.data[WEBHOOK_ID], receiver.async_handle,
             local_only=True, allowed_methods=("POST",),
@@ -56,9 +64,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: HoreveilConfigEntry) -> 
     except Exception:
         raise ConfigEntryError("Unable to initialize the Horéveil receiver") from None
     entry.runtime_data = receiver
+    if data is not None:
+        data.setdefault(CALENDAR_RECEIVERS, {})[entry.entry_id] = receiver
     try:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except BaseException:
+        if data is not None:
+            data[CALENDAR_RECEIVERS].pop(entry.entry_id, None)
         webhook.async_unregister(hass, entry.data[WEBHOOK_ID])
         await receiver.async_close()
         raise
@@ -71,6 +83,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: HoreveilConfigEntry) ->
         return False
     webhook.async_unregister(hass, entry.data[WEBHOOK_ID])
     await entry.runtime_data.async_close()
+    if (data := getattr(hass, "data", None)) is not None:
+        data.get(CALENDAR_RECEIVERS, {}).pop(entry.entry_id, None)
     return True
 
 

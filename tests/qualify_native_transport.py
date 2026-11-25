@@ -111,7 +111,7 @@ async def exercise(client, origin, admin, guest, registry, through_proxy):
         await check_request(client, "GET", status, 401, headers=auth)
 
 
-async def exercise_signed(client, origin, admin, guest):
+async def exercise_signed(client, origin, admin, guest, entry, backend):
     from http_message_signatures import HTTPMessageSigner, HTTPSignatureKeyResolver, algorithms
 
     base = origin + "/api/horeveil/direct/v1/"
@@ -127,6 +127,7 @@ async def exercise_signed(client, origin, admin, guest):
     async with client.ws_connect(origin + "/api/websocket") as ws:
         assert await _authenticate(ws, guest["access_token"]) == "auth_ok"
         assert not (await _pair(ws, "info"))["success"]
+        assert not (await _pair(ws, "calendar_source", entry_id=entry.entry_id, pairing_id=None, confirmed=True))["success"]
     async with client.ws_connect(origin + "/api/websocket") as ws:
         assert await _authenticate(ws, admin["access_token"]) == "auth_ok"
         assert origin in (await _pair(ws, "info"))["result"]["https_origins"]
@@ -164,8 +165,122 @@ async def exercise_signed(client, origin, admin, guest):
         activate = prepare("activate", {"confirmed": True})
         assert (await check_request(client, "POST", base + "activate", 200, **activate))["state"] == "active"
         await check_request(client, "POST", base + "activate", 401, **activate)
+        calendar = base + "calendar"
+        body = snapshot() | {"installation_id": claim["installation_id"]}
+        await check_request(client, "POST", calendar, 401, json=body)
+        await check_request(client, "POST", calendar, 403, **prepare("calendar", body))
+        selection = {"entry_id": entry.entry_id, "pairing_id": pairing_id, "confirmed": True}
+        assert (await _pair(ws, "calendar_source", **selection))["success"]
+        signed = prepare("calendar", body)
+        assert (await check_request(client, "POST", calendar, 200, **signed))["result"] == "accepted"
+        await check_request(client, "POST", calendar, 401, **signed)
+        assert (await check_request(client, "POST", calendar, 200, **prepare("calendar", body)))["result"] == "duplicate"
+        assert (await _pair(ws, "info"))["result"]["calendars"][0]["last_success"]
+        assert entry.runtime_data.current.installation_id == claim["installation_id"]
+        path = "/api/webhook/" + entry.data["webhook_id"]
+        assert (await check_request(client, "POST", backend + path, 403, json=snapshot(),
+                                    headers={"X-Horeveil-Token": entry.data["relay_token"]}))["result"] == "source_not_authorized"
+        empty = body | {"revision": body["revision"] + 1, "alarms": {}, "occurrences": []}
+        assert (await check_request(client, "POST", calendar, 200, **prepare("calendar", empty)))["result"] == "accepted"
+        assert not tuple(entry.runtime_data.current.iter_calendar_occurrences())
         assert (await _pair(ws, "revoke", pairing_id=pairing_id, confirmed=True))["success"]
         await check_request(client, "POST", base + "status", 401, **prepare("status", {}))
+        await check_request(client, "POST", calendar, 401, **prepare("calendar", empty))
+        assert entry.runtime_data.current is None
+        assert (await _pair(ws, "calendar_source", **(selection | {"pairing_id": None})))["success"]
+
+
+async def exercise_android(client, origin, admin, entry, profile, adb, serial):
+    """Run the Android transport with a disposable CA and the real Core views."""
+    from homeassistant.core import callback
+    from homeassistant.helpers.dispatcher import async_dispatcher_connect
+
+    package = "fr.moosketair.horeveil"
+    command = [str(adb), "-s", serial]
+    input_file = "files/horeveil-calendar-recette.json"
+    port = origin.rsplit(":", 1)[1]
+
+    async def launch(*args, stdin=None):
+        return await asyncio.create_subprocess_exec(
+            *command, *args, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+
+    async def adb_ok(*args, body=None):
+        proc = await launch(*args, stdin=subprocess.PIPE if body is not None else None)
+        output, _ = await proc.communicate(body)
+        if proc.returncode:
+            raise RuntimeError(f"ADB fixture setup failed ({proc.returncode})")
+        return output
+
+    observations = []
+    receiver = entry.runtime_data
+
+    @callback
+    def observe():
+        if snapshot := receiver.current:
+            observations.append((snapshot.revision, len(tuple(snapshot.iter_calendar_occurrences()))))
+
+    remove = async_dispatcher_connect(receiver._hass, receiver.update_signal, observe)
+    proc = None
+    try:
+        await adb_ok("reverse", f"tcp:{port}", f"tcp:{port}")
+        async with client.ws_connect(origin + "/api/websocket") as ws:
+            assert await _authenticate(ws, admin["access_token"]) == "auth_ok"
+            previous = (await _pair(ws, "info"))["result"]["phones"]
+            display = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            display_key = _b64(display.public_key().public_bytes(
+                serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+            ))
+            invite = (await _pair(ws, "invite", origin=origin, display_key=display_key))["result"]
+            payload = json.dumps({
+                "origin": origin, "code": _decode_code(invite["code_encrypted"], display),
+                "ca": (profile / "ca.pem").read_text(),
+            }).encode()
+            await adb_ok("shell", "-T", f"run-as {package} sh -c 'mkdir -p files && cat > {input_file}'",
+                         body=payload)
+            proc = await launch(
+                "shell", "am", "instrument", "-w", "-e", "class",
+                f"{package}.ui.DirectCalendarAndroidTest#signedCalendarReachesDisposableHomeAssistant",
+                f"{package}.test/androidx.test.runner.AndroidJUnitRunner",
+            )
+
+            async def wait_for(operation, predicate):
+                async with asyncio.timeout(40):
+                    while proc.returncode is None:
+                        result = await operation()
+                        if predicate(result):
+                            return result
+                        await asyncio.sleep(0.4)
+                raise RuntimeError("Android fixture stopped before completing the association")
+
+            review = await wait_for(
+                lambda: _pair(ws, "status", invitation_id=invite["invitation_id"], display_key=display_key),
+                lambda response: response.get("result", {}).get("state") == "awaiting_approval",
+            )
+            pairing_id = review["result"]["pairing_id"]
+            assert pairing_id not in previous
+            assert (await _pair(ws, "approve", invitation_id=invite["invitation_id"],
+                                pairing_id=pairing_id, confirmed=True))["success"]
+            await wait_for(lambda: _pair(ws, "info"), lambda response: pairing_id in response["result"]["phones"])
+            selection = {"entry_id": entry.entry_id, "confirmed": True}
+            assert (await _pair(ws, "calendar_source", pairing_id=pairing_id, **selection))["success"]
+            async with asyncio.timeout(50):
+                output, _ = await proc.communicate()
+            if b"OK (1 test)" not in output:
+                raise RuntimeError(output.decode(errors="replace"))
+            assert observations[0][0] == 1 and observations[0][1] > 0, observations
+            assert observations[-1] == (2, 0), observations
+            assert (await _pair(ws, "revoke", pairing_id=pairing_id, confirmed=True))["success"]
+            assert receiver.current is None
+            assert (await _pair(ws, "calendar_source", pairing_id=None, **selection))["success"]
+        print("Émulateur Android : appairage Keystore, envoi signé et retrait acquitté.", flush=True)
+    finally:
+        remove()
+        if proc is not None and proc.returncode is None:
+            proc.terminate()
+            await proc.wait()
+        await adb_ok("shell", "run-as", package, "rm", "-f", input_file)
+        await adb_ok("reverse", "--remove", f"tcp:{port}")
 
 
 async def relay_tcp(reader, writer, nginx_port):
@@ -189,7 +304,7 @@ async def relay_tcp(reader, writer, nginx_port):
         writer.close()
 
 
-async def run(profile, nginx, stock, through_proxy, signed):
+async def run(profile, nginx, stock, through_proxy, signed, adb=None, android_serial=None):
     _certificate_files(profile, nginx=False)
     core_port, proxy_port = _free_port(), _free_port()
     backend = f"{'http' if through_proxy else 'https'}://127.0.0.1:{core_port}"
@@ -253,7 +368,9 @@ http {{ server {{ listen 127.0.0.1:{proxy_port} ssl proxy_protocol;
                 await check_request(client, method, url, 400,
                                     headers={"X-Forwarded-For": "127.0.0.1", "X-Forwarded-Proto": "https"})
             if signed:
-                await exercise_signed(client, origin, admin, guest)
+                await exercise_signed(client, origin, admin, guest, entry, backend)
+                if adb is not None:
+                    await exercise_android(client, origin, admin, entry, profile, adb, android_serial)
             else:
                 await exercise(client, origin, admin, guest, registry, through_proxy)
             # A real synthetic webhook, with credentials from this disposable profile only.
@@ -282,10 +399,16 @@ if __name__ == "__main__":
     parser.add_argument("--nginx", type=Path)
     parser.add_argument("--stock-proxy", type=Path)
     parser.add_argument("--signed", action="store_true", help="Exercise the installed signed profile instead of the qualification probe")
+    parser.add_argument("--adb", type=Path, help="Use the existing app and test APKs on a disposable emulator")
+    parser.add_argument("--android-serial")
     args = parser.parse_args()
     if bool(args.nginx) != bool(args.stock_proxy):
         parser.error("--nginx and --stock-proxy are required together")
+    if args.adb or args.android_serial:
+        if not args.adb or not args.android_serial or not args.android_serial.startswith("emulator-") or not args.signed or args.nginx:
+            parser.error("Android requires --signed, --adb, --android-serial emulator-PORT and direct HTTPS")
     with TemporaryDirectory(prefix="horeveil-native-qualification-") as name:
         profile = Path(name)
         copytree(_ROOT / "custom_components" / _DOMAIN, profile / "custom_components" / _DOMAIN)
-        asyncio.run(run(profile, args.nginx, args.stock_proxy, bool(args.nginx), args.signed))
+        asyncio.run(run(profile, args.nginx, args.stock_proxy, bool(args.nginx), args.signed,
+                        args.adb, args.android_serial))

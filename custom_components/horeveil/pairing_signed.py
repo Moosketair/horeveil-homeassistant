@@ -1,6 +1,8 @@
 """Scoped, signed requests for the native pairing profile."""
 
+import asyncio
 from base64 import urlsafe_b64decode, urlsafe_b64encode
+from http import HTTPStatus
 from ipaddress import ip_address
 import re
 from time import time
@@ -14,6 +16,7 @@ from http_message_signatures import HTTPMessageVerifier, HTTPSignatureKeyResolve
 
 from .pairing import InvalidPairingCredential, PairingClockSkew
 from .pairing_http import PairingHttp, _InvalidRequest, _credential, _decode_32, _read_json, _single_header, _uuid
+from .receiver import SnapshotRequestError, _reply, async_read_snapshot_body
 
 DIRECT_BASE = "/api/horeveil/direct/v1"
 _COMPONENTS = ("@method", "@target-uri", "content-type", "content-digest", "horeveil-server-id")
@@ -83,6 +86,35 @@ def _source(request):
 class SignedPairingHttp(PairingHttp):
     def __init__(self, registry):
         super().__init__(registry, local_source=_source, direct=True)
+
+    async def calendar(self, request: web.Request, hass, find_receiver) -> web.Response:
+        async def handler(request):
+            if request.raw_path != f"{DIRECT_BASE}/calendar":
+                raise _InvalidRequest
+            pairing_id, secret = _credential(request)
+            try:
+                body = await async_read_snapshot_body(request)
+            except SnapshotRequestError as error:
+                return _reply(error.status, error.result)
+
+            def verify(key, origin, server_id):
+                return _verify(request, body, "calendar", pairing_id, key, origin, server_id)
+
+            async def publish(association):
+                receiver = find_receiver(pairing_id)
+                if receiver is None:
+                    return _reply(HTTPStatus.FORBIDDEN, "source_not_authorized")
+                return await receiver.async_handle_direct(body, pairing_id, association.installation_id)
+
+            task = hass.async_create_task(self._registry.async_publish_calendar(pairing_id, secret, verify, publish))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Let the tracked task finish, and retrieve any failure without logging request data.
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+
+        return await self._run(request, handler)
 
     async def signed(self, request: web.Request, operation: str) -> web.Response:
         async def handler(request):

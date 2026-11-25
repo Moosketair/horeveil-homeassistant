@@ -159,7 +159,7 @@ class PairingHttp:
         return None
 
     async def _run(
-        self, request: web.Request, operation: Callable[[web.Request], Awaitable[dict]],
+        self, request: web.Request, operation: Callable[[web.Request], Awaitable[dict | web.Response]],
     ) -> web.Response:
         if not request.secure or self._local_source is None or (
             source := self._local_source(request)
@@ -170,7 +170,8 @@ class PairingHttp:
         try:
             if request.query_string:
                 raise _InvalidRequest
-            return _response(await operation(request))
+            result = await operation(request)
+            return result if isinstance(result, web.Response) else _response(result)
         except InvalidPairingCredential:
             return _response({"error": "invalid_credential"}, 401)
         except PairingConflict:

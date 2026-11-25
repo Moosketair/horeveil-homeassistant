@@ -25,7 +25,7 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import DOMAIN
+from .const import CALENDAR_RECEIVERS, DOMAIN, PAIRING_RUNTIME as _RUNTIME_KEY
 from .pairing import InvalidPairingCredential, PairingError, PairingRegistry, validate_origin
 from .pairing_http import PairingHttp
 from .pairing_native import NativePairingIngress
@@ -37,7 +37,6 @@ _LOOPBACK = IPv4Address("127.0.0.1")
 _OAEP = padding.OAEP(
     mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None,
 )
-_RUNTIME_KEY = "horeveil.local_pairing_test"
 _PANEL = "horeveil-association"
 _PANEL_MODULE = "/api/horeveil/pairing-panel.js"
 _PUBLIC_KEY = re.compile(r"[A-Za-z0-9_-]{392}", re.ASCII)
@@ -367,7 +366,48 @@ async def _info(hass, connection, msg) -> None:
     if operation.test.universal:
         result["https_origins"] = origins = _https_origins(hass)
         result["suggested_origin"] = origins[0] if origins else None
+        result["calendars"] = [
+            {
+                "entry_id": entry.entry_id,
+                "title": entry.title,
+                "pairing_id": str(receiver.direct_source) if receiver.direct_source else None,
+                "last_success": receiver.received_at.isoformat() if receiver.received_at else None,
+            }
+            for entry in hass.config_entries.async_entries(DOMAIN)
+            if (receiver := hass.data.get(CALENDAR_RECEIVERS, {}).get(entry.entry_id)) is not None
+        ]
     operation.result(result)
+
+
+@websocket_api.websocket_command({
+    "type": f"{_WS}/calendar_source", "entry_id": str, "confirmed": bool,
+    "pairing_id": probatio.Any(None, str),
+})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _calendar_source(hass, connection, msg) -> None:
+    operation = _AdminOperation(hass, connection, msg)
+    if not operation.authorized:
+        return
+    try:
+        receivers = hass.data.get(CALENDAR_RECEIVERS, {})
+        receiver = receivers.get(msg["entry_id"])
+        if not operation.test.universal or msg["confirmed"] is not True or receiver is None:
+            raise PairingError("Calendar source unavailable")
+        pairing_id = _uuid(msg["pairing_id"]) if msg["pairing_id"] is not None else None
+
+        async def select(source):
+            if source is not None and any(
+                candidate is not receiver and candidate.direct_source == source
+                for candidate in receivers.values()
+            ):
+                return False
+            return await receiver.async_select_source(source)
+
+        await operation.test.registry.async_select_calendar_source(pairing_id, select)
+        operation.result({"state": "selected"})
+    except (HomeAssistantError, OSError, ValueError):
+        operation.error("calendar_source_unavailable")
 
 
 @websocket_api.websocket_command({"type": f"{_WS}/revoke", "pairing_id": str, "confirmed": bool})
@@ -381,7 +421,13 @@ async def _revoke(hass, connection, msg) -> None:
         if msg.get("confirmed") is not True:
             operation.error("confirmation_required")
             return
-        revoked = await operation.test.registry.async_revoke(_uuid(msg.get("pairing_id")))
+        async def purge(pairing_id):
+            receivers = tuple(hass.data.get(CALENDAR_RECEIVERS, {}).values())
+            cleaned = [await receiver.async_select_source(None, forget=pairing_id) for receiver in receivers]
+            if not all(cleaned):
+                raise PairingError("Calendar storage unavailable")
+
+        revoked = await operation.test.registry.async_revoke(_uuid(msg.get("pairing_id")), purge=purge)
         if revoked:
             operation.result({"state": "revoked"})
         else:
@@ -487,15 +533,24 @@ async def async_setup_local_pairing(
             async def post(self, request):
                 if self.operation == "claim":
                     return await test.http.claim(request)
+                if self.operation == "calendar":
+                    def find_receiver(pairing_id):
+                        found = [receiver for receiver in hass.data.get(CALENDAR_RECEIVERS, {}).values()
+                                 if receiver.direct_source == pairing_id]
+                        return found[0] if len(found) == 1 else None
+
+                    return await test.http.calendar(request, hass, find_receiver)
                 return await test.http.signed(request, self.operation)
 
-        for operation in ("claim", "enroll", "status", "activate", "cancel"):
+        for operation in ("claim", "enroll", "status", "activate", "cancel", "calendar"):
             server.register_view(DirectView(operation))
     if local_test or test.native is not None:
         for view in (_ClaimView, _StatusView, _ActivateView):
             server.register_view(view(test))
     for command in (_invite, _status, _approve, _cancel, _info, _revoke):
         websocket_api.async_register_command(hass, command)
+    if universal:
+        websocket_api.async_register_command(hass, _calendar_source)
     if proxy is not None:
         websocket_api.async_register_command(hass, _direct_access)
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, test.stop)

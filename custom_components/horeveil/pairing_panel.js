@@ -96,6 +96,11 @@ const template = `
         <p id="empty">Aucun téléphone associé.</p>
         <ul id="phones"></ul>
       </section>
+      <section id="calendar-sources" aria-labelledby="calendar-sources-title" hidden>
+        <h2 id="calendar-sources-title">Synchronisation du calendrier</h2>
+        <p>Choisissez la source autorisée pour chaque entrée. Le téléphone doit aussi autoriser le partage. Changer de source efface la projection affichée.</p>
+        <div id="calendar-entries"></div>
+      </section>
     </div>
   </main>`;
 
@@ -240,6 +245,7 @@ class HoreveilAssociation extends HTMLElement {
     this.#element("content").hidden = true;
     this.#element("origin").value = "";
     this.#element("phones").replaceChildren();
+    this.#element("calendar-entries").replaceChildren();
     this.#notice("Accès réservé à un administrateur connecté en HTTPS.");
   }
 
@@ -328,6 +334,44 @@ class HoreveilAssociation extends HTMLElement {
       button.onclick = () => this.#revoke(id);
       item.append(`Téléphone ${id} `, button);
       return item;
+    }));
+    this.#element("calendar-sources").hidden = !info.calendars?.length;
+    this.#element("calendar-entries").replaceChildren(...(info.calendars ?? []).map((entry) => {
+      const row = document.createElement("div");
+      const label = document.createElement("label");
+      const select = document.createElement("select");
+      const choices = [["", "Webhook local"], ...info.phones.map((id) => [id, `Téléphone ${id}`])];
+      if (entry.pairing_id && !info.phones.includes(entry.pairing_id)) {
+        choices.push([entry.pairing_id, "Source révoquée · écritures bloquées"]);
+      }
+      for (const [value, title] of choices) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = title;
+        select.append(option);
+      }
+      select.value = entry.pairing_id ?? "";
+      label.append(`${entry.title} · source active `, select);
+      const save = document.createElement("button");
+      save.type = "button";
+      save.textContent = "Autoriser cette source";
+      save.disabled = true;
+      select.onchange = () => { save.disabled = select.value === (entry.pairing_id ?? ""); };
+      save.onclick = () => {
+        if (!window.confirm("Changer la source et effacer la projection actuelle ?")) return;
+        this.#run(async (generation) => {
+          await this.#call("calendar_source", {
+            entry_id: entry.entry_id, pairing_id: select.value || null, confirmed: true,
+          });
+          await this.#load(generation);
+        });
+      };
+      const last = document.createElement("p");
+      last.textContent = entry.last_success
+        ? `Dernière réception réussie · ${new Date(entry.last_success).toLocaleString()}`
+        : "Aucune réception pour cette source.";
+      row.append(label, save, last);
+      return row;
     }));
     this.#notice("");
     return info.phones;

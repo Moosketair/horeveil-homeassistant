@@ -39,6 +39,6 @@ Les options YAML de l’ancien banc sélectionnent toujours son profil de recett
 - `tests/` — `qualify_native_transport.py`, `real_upgrade_030.py`, `test_pairing_ha.py`, `test_pairing_signed.py`, `test_receiver.py`.
 - `requirements-test.txt` et ce guide.
 
-## Étape suivante proposée
+## Synchronisation directe
 
-Après validation, autoriser explicitement le calendrier sur Android et dans HA. Réutiliser la projection, les consentements par alarme et la file WorkManager pour signer la publication. Le récepteur conserve ses accusés après persistance et ses contrôles d’identité, de révision et de doublon. Tester une bascule explicite depuis Node-RED avec la même entrée et les mêmes entités. Aucun transport de calendrier direct n’est activé à cette étape.
+La [recette 3C4C.4](SYNCHRONISATION_DIRECTE_3C4C4.md) décrit la publication signée du calendrier après autorisation sur les deux appareils.

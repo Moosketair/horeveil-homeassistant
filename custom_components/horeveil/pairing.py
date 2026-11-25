@@ -2,7 +2,7 @@
 
 import asyncio
 from base64 import urlsafe_b64encode
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -691,14 +691,63 @@ class PairingRegistry:
                 and permission in association.phone_permissions.consultation
             )
 
-    async def async_revoke(self, pairing_id: UUID) -> bool:
+    async def async_select_calendar_source(
+        self, pairing_id: UUID | None, select: Callable[[UUID | None], Awaitable[bool]],
+    ) -> None:
+        """Authorize a signed phone as the single calendar writer for its entry."""
+        async with self._lock:
+            if pairing_id is not None:
+                association = self._associations.get(pairing_id)
+                if (association is None or association.state is not AssociationState.ACTIVE
+                        or association.public_key is None):
+                    raise InvalidPairingCredential("Pairing unavailable")
+            async def write():
+                if not await select(pairing_id):
+                    raise PairingError("Calendar storage unavailable")
+
+            await _persist(write)
+
+    async def async_prepare_calendar_receiver(
+        self, pairing_id: UUID, purge: Callable[[UUID], Awaitable[bool]],
+    ) -> None:
+        """Remove projections for a writer revoked while the entry was unloaded."""
+        async with self._lock:
+            _ = self.server_id
+            association = self._associations.get(pairing_id)
+            if association is None or association.state is AssociationState.REVOKED:
+                if not await purge(pairing_id):
+                    raise PairingError("Calendar storage unavailable")
+
+    async def async_publish_calendar[T](
+        self, pairing_id: UUID, secret: bytes, verify: VerifySignature,
+        publish: Callable[[Association], Awaitable[T]],
+    ) -> T:
+        """Keep authorization, replay reservation and persistence ordered with revocation."""
+        async with self._lock:
+            server_id = self.server_id
+            association = self._associations.get(pairing_id)
+            if (association is None or association.state is not AssociationState.ACTIVE
+                    or association.public_key is None or association.credential_digest is None
+                    or not compare_digest(association.credential_digest, sha256(secret).digest())):
+                raise InvalidPairingCredential("Pairing unavailable")
+            await self._consume_nonce(pairing_id, *verify(association.public_key, association.origin, server_id))
+            return await publish(association)
+
+    async def async_revoke(
+        self, pairing_id: UUID, *, purge: Callable[[UUID], Awaitable[None]] | None = None,
+    ) -> bool:
         """Persist an irreversible tombstone for one association."""
         async with self._lock:
             server_id = self.server_id
             association = self._associations.get(pairing_id)
             if association is None or association.state is AssociationState.REVOKED:
                 return False
-            await self._commit(server_id, {**self._associations, pairing_id: association.revoked()})
+            async def write():
+                await self._commit(server_id, {**self._associations, pairing_id: association.revoked()})
+                if purge is not None:
+                    await purge(pairing_id)
+
+            await _persist(write)
             return True
 
     async def async_list_active(self) -> tuple[UUID, ...]:

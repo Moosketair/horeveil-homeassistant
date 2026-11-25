@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Add a Horéveil receiver",
-        "description": "Copy the path and token for your local Node-RED relay, then submit. Each receiver is bound to the first Horéveil installation that sends it a valid snapshot.\n\nWebhook path: `{path}`\n\n`X-Horeveil-Token` header: `{token}`"
+        "description": "Submit to add Horéveil. To connect directly, open the Horéveil panel and pair your phone. The credentials below are for the optional local webhook.\n\nWebhook path: `{path}`\n\n`X-Horeveil-Token` header: `{token}`"
       }
     }
   },

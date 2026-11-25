@@ -1,6 +1,6 @@
 # Horéveil pour Home Assistant
 
-Horéveil reçoit les instantanés `calendar_snapshot` v1 de l’application Android via un relais Node-RED local. Chaque récepteur dispose d’un calendrier Home Assistant en lecture seule, alimenté par son dernier instantané valide.
+Horéveil reçoit les instantanés `calendar_snapshot` v1 de l’application Android par synchronisation directe ou via un relais local comme Node-RED. Chaque entrée expose un calendrier en lecture seule et quatre capteurs alimentés par son dernier instantané valide.
 
 Version de ce code **0.3.0**. Home Assistant **2026.10 ou ultérieur**. Le dépôt personnalisé installe le code publié sur `main`. Pour essayer cette version depuis la branche locale, utilisez l’installation manuelle.
 
@@ -32,8 +32,13 @@ Copiez `custom_components/horeveil` dans le répertoire de configuration de Home
 ## Configuration
 
 1. Dans **Paramètres → Appareils et services → Ajouter une intégration**, recherchez **Horéveil**.
-2. Copiez le chemin du webhook et le jeton affichés dans la boîte de configuration, puis validez. Gardez ces deux valeurs dans votre gestionnaire de secrets. Chaque entrée est associée à la première installation Android dont le snapshot est accepté. Créez une entrée distincte par installation.
-3. Configurez le [relais Node-RED](docs/NODE_RED.md). Dans Android, utilisez **Synchroniser maintenant** sur la destination de recette. Vérifiez côté relais que Home Assistant répond avec `{"result":"accepted"}` ou `{"result":"duplicate"}`.
+2. Validez la création de l’entrée. Les identifiants affichés servent uniquement si vous utilisez le webhook local.
+3. Ouvrez le panneau **Horéveil**, associez le téléphone via le QR ou la saisie manuelle et approuvez les codes des deux côtés. Dans **Synchronisation du calendrier**, autorisez ce téléphone comme source de l’entrée.
+4. Sur Android, ouvrez **Réglages → Intégrations → Home Assistant**, activez le partage et sélectionnez les alarmes. La synchronisation utilise une adresse HTTPS existante de Home Assistant. Le [guide 3C4C.4](docs/SYNCHRONISATION_DIRECTE_3C4C4.md) décrit la mise à jour et la recette.
+
+### Webhook local
+
+L’entrée utilise le webhook tant que vous n’avez pas choisi un téléphone comme source directe. Pour conserver ce mode, utilisez les identifiants affichés pendant la configuration, stockez-les dans votre gestionnaire de secrets, puis configurez le [relais Node-RED](docs/NODE_RED.md). Le premier instantané accepté lie la projection à son installation Android. Les destinations webhook de l’application restent disponibles indépendamment de la source choisie dans Home Assistant.
 
 Le webhook natif accepte les POST sur le réseau local. L’en-tête `X-Horeveil-Token` apporte une authentification indépendante du chemin secret. Gardez le trajet Node-RED → Home Assistant sur le LAN. Si un proxy public dessert Home Assistant, bloquez-y le chemin de ce récepteur et excluez ce chemin, les en-têtes et le corps des journaux.
 
@@ -59,7 +64,7 @@ Le récepteur applique le [contrat Android v1](docs/CALENDAR_SNAPSHOT_SCHEMA_V1.
 
 Home Assistant peut répondre avec un 200 vide pour un chemin inconnu ou un appel distant bloqué. Le relais doit confirmer la présence du résultat attendu avant de répondre positivement à Android.
 
-Le stockage natif `Store` garde le texte JSON d’origine et la date de réception séparément, avec écriture atomique. Les états internes sont `empty`, `fresh` et `expired`. Dès `expires_at`, le snapshot cesse d’être disponible comme donnée courante. Il reste sur disque pour conserver l’identité et la dernière révision, y compris après redémarrage. La suppression de l’entrée efface son snapshot. Pour changer d’installation ou remplacer un secret perdu, supprimez l’entrée, créez-en une nouvelle, puis demandez une synchronisation Android.
+Le stockage natif `Store` garde le texte JSON d’origine et la date de réception séparément, avec écriture atomique. Les états internes sont `empty`, `fresh` et `expired`. Dès `expires_at`, le snapshot cesse d’être disponible comme donnée courante. Il reste sur disque pour conserver l’identité et la dernière révision, y compris après redémarrage. La suppression de l’entrée efface son snapshot. Un changement de source dans le panneau efface la projection actuelle et conserve l’entrée ainsi que ses entités.
 
 ## Calendrier Horéveil
 
@@ -88,13 +93,11 @@ Les [événements de sonnerie et de commandes réelles](docs/EVENEMENTS_TEMPS_RE
 4. Sur une entrée de recette, envoyez un snapshot synthétique avec une date `expires_at` proche et suspendez les envois. Après cette échéance, vérifiez que le calendrier est indisponible et que l’action `calendar.get_events` ne renvoie rien pour la période testée. Vérifiez le même état après redémarrage, puis la récupération à la réception d’une révision fraîche.
 5. Avec deux réveils proches, vérifiez le prochain réveil et le compteur dans les entités Horéveil. Laissez passer le premier début sonore et vérifiez que les deux capteurs évoluent sans nouvel envoi. Après un redémarrage et après expiration, vérifiez que la dernière réception affiche toujours le même horodatage.
 
-## Appairage direct de recette
+## Guides de recette
 
-Le [guide Home Assistant Container, Dockge et Nginx Proxy Manager](docs/APPAIRAGE_DIRECT_3C4B7.md) décrit le mode natif optionnel et les vérifications avant activation.
+La [synchronisation directe 3C4C.4](docs/SYNCHRONISATION_DIRECTE_3C4C4.md) utilise le [profil d’appairage signé 3C4C.3](docs/APPAIRAGE_NATIF_3C4C3.md). Les guides 3C4B décrivent les bancs antérieurs.
 
 ## Tests Python ciblés
-
-Résultat local sous Python 3.13.14 et aiohttp 3.14.5 — 30 tests réussis, dont les 25 scénarios existants.
 
 ```powershell
 python -m venv .venv
@@ -102,4 +105,4 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Les tests partent de l’exemple Android copié dans le contrat. Ils utilisent de vraies requêtes HTTP via aiohttp sur la boucle locale et un double de test pour les API Home Assistant, avec des écritures sur disque pour la restauration. La recette des capteurs 0.3.0 sur Home Assistant reste à faire. Les validations officielles HACS et hassfest sont configurées dans GitHub Actions. Voir la [documentation des capteurs](https://contributors.home-assistant.io/core/entities/sensor/).
+Les tests partent de l’exemple Android copié dans le contrat. Ils utilisent de vraies requêtes HTTP via aiohttp sur la boucle locale et un double de test pour les API Home Assistant, avec des écritures sur disque pour la restauration. Le guide 3C4C.4 indique les commandes pour Core isolé et les vérifications réellement exécutées. Les validations HACS et hassfest sont configurées dans GitHub Actions.

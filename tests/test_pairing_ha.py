@@ -197,8 +197,9 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         hass = self.new_ha()
         await setup_domain(hass, {})
         self.assertIn("/api/horeveil/direct/v1/enroll", hass.views)
+        self.assertIn("/api/horeveil/direct/v1/calendar", hass.views)
         self.assertNotIn(f"{_BASE}/claim", hass.views)
-        self.assertEqual(len(hass.ws_commands), 6)
+        self.assertEqual(len(hass.ws_commands), 7)
         self.assertTrue(hass.panels["horeveil-association"]["require_admin"])
         for field, value in (
             ("server_host", ["0.0.0.0"]), ("server_host", ["127.0.0.1", "::"]),
