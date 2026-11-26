@@ -199,7 +199,11 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/horeveil/direct/v1/enroll", hass.views)
         self.assertIn("/api/horeveil/direct/v1/calendar", hass.views)
         self.assertNotIn(f"{_BASE}/claim", hass.views)
-        self.assertEqual(len(hass.ws_commands), 7)
+        self.assertEqual(
+            set(hass.ws_commands), {f"horeveil/pairing_test/{command}" for command in (
+                "invite", "status", "approve", "cancel", "info", "rename", "revoke", "calendar_source",
+            )},
+        )
         self.assertTrue(hass.panels["horeveil-association"]["require_admin"])
         for field, value in (
             ("server_host", ["0.0.0.0"]), ("server_host", ["127.0.0.1", "::"]),
@@ -236,6 +240,25 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.ws("invite", origin=_ORIGIN))["error"], "unauthorized")
         self.cloud = False
         self.assertEqual((await self.client.get(url)).status, 401)
+
+    async def test_rename_rejects_http_in_the_standard_setup(self):
+        hass = self.new_ha()
+        await setup_domain(hass, {})
+        results = []
+        connection = SimpleNamespace(
+            user=self.admin,
+            send_result=lambda _, data: results.append(data),
+            send_error=lambda _, code, _message: results.append(code),
+        )
+        token = current_request.set(SimpleNamespace(secure=False))
+        try:
+            await hass.ws_commands["horeveil/pairing_test/rename"](hass, connection, {
+                "id": 1, "pairing_id": str(uuid4()), "label": "Essai",
+            })
+        finally:
+            current_request.reset(token)
+        self.assertEqual(results, ["unauthorized"])
+        self.assertFalse((self.directory / "horeveil.pairing_labels").exists())
 
     async def test_admin_certificate_approval_and_durable_activation(self):
         await self.start()
@@ -329,6 +352,9 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (await self.ws("revoke", pairing_id=str(uuid4()), confirmed=True))["error"], "unauthorized",
         )
+        self.assertEqual(
+            (await self.ws("rename", pairing_id=str(uuid4()), label="Essai"))["error"], "unauthorized",
+        )
 
     async def test_qr_module_requires_the_pinned_local_connection(self):
         await self.start()
@@ -377,10 +403,44 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((await response.json())["state"], "active")
         self.assertEqual((await self.ws("info"))["result"]["phones"], [pairing_id])
+        registry = self.hass.data["horeveil.local_pairing_test"].registry
+        self.assertEqual(await registry.async_list_active(signed_only=True), ())
+        registry_file = self.directory / "horeveil.pairings"
+        identity = registry_file.read_bytes()
+        self.assertEqual(
+            (await self.ws("rename", pairing_id=pairing_id, label="a" * 65))["error"], "invalid_label",
+        )
+        self.assertEqual(
+            (await self.ws("rename", pairing_id=pairing_id, label="test\nlabel"))["error"], "invalid_label",
+        )
+        labels = self.hass.data["horeveil.local_pairing_test"].labels
+        labels.fail = True
+        self.assertEqual(
+            (await self.ws("rename", pairing_id=pairing_id, label="Essai"))["error"], "rename_unavailable",
+        )
+        labels.fail = False
+        self.assertEqual(
+            (await self.ws("rename", pairing_id=pairing_id, label="  Téléphone de recette  "))["result"],
+            {"state": "renamed"},
+        )
+        self.assertEqual(registry_file.read_bytes(), identity)
+        restarted = self.new_ha()
+        await setup_domain(restarted, self.config())
+        self.hass = restarted
+        self.assertEqual((await self.ws("info"))["result"]["phone_labels"], {pairing_id: "Téléphone de recette"})
+        url = self.server.make_url(f"{_BASE}/status")
+        self.assertEqual((await self.client.get(url, headers=self.auth(pairing_id))).status, 200)
+        self.assertEqual(
+            (await self.ws("rename", pairing_id=pairing_id, label=""))["result"], {"state": "renamed"},
+        )
+        self.assertEqual((await self.ws("info"))["result"]["phone_labels"], {})
         declined = await self.ws("revoke", pairing_id=pairing_id, confirmed=False)
         self.assertEqual(declined["error"], "confirmation_required")
         result = await self.ws("revoke", pairing_id=pairing_id, confirmed=True)
         self.assertEqual(result["result"]["state"], "revoked")
         self.assertEqual((await self.ws("info"))["result"]["phones"], [])
+        self.assertEqual(
+            (await self.ws("rename", pairing_id=pairing_id, label="Essai"))["error"], "phone_unavailable",
+        )
         response = await self.client.get(self.server.make_url(f"{_BASE}/status"), headers=self.auth(pairing_id))
         self.assertEqual(response.status, 401)

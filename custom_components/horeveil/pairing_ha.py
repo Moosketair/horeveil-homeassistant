@@ -1,5 +1,6 @@
 """Home Assistant administration and pairing views."""
 
+from asyncio import Lock
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from ipaddress import IPv4Address
 import logging
@@ -24,6 +25,7 @@ from homeassistant.components.panel_custom import async_register_panel
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.storage import Store
 
 from .const import CALENDAR_RECEIVERS, DOMAIN, PAIRING_RUNTIME as _RUNTIME_KEY
 from .pairing import InvalidPairingCredential, PairingError, PairingRegistry, validate_origin
@@ -71,6 +73,8 @@ class _PairingRuntime:
         self.proxy = proxy
         self.http = PairingHttp(registry, local_source=self.local_source, origin=self.origin)
         self.universal = False
+        self.labels: Store[dict[str, str]]
+        self.labels_lock = Lock()
 
     @property
     def native(self) -> NativePairingIngress | None:
@@ -359,6 +363,16 @@ async def _info(hass, connection, msg) -> None:
         "test_origin": operation.test.origin,
         "phones": [str(pairing_id) for pairing_id in active],
     }
+    if active:
+        async with operation.test.labels_lock:
+            try:
+                labels = await operation.test.labels.async_load() or {}
+            except (HomeAssistantError, OSError, ValueError):
+                labels = {}
+        if isinstance(labels, dict):
+            result["phone_labels"] = {
+                key: labels[key] for key in result["phones"] if isinstance(labels.get(key), str)
+            }
     if operation.test.proxy is not None:
         result.update(direct_configured=True, direct_origin=operation.test.proxy.origin)
     if (native := operation.test.native) is not None:
@@ -366,6 +380,9 @@ async def _info(hass, connection, msg) -> None:
     if operation.test.universal:
         result["https_origins"] = origins = _https_origins(hass)
         result["suggested_origin"] = origins[0] if origins else None
+        result["calendar_phones"] = [
+            str(pairing_id) for pairing_id in await operation.test.registry.async_list_active(signed_only=True)
+        ]
         result["calendars"] = [
             {
                 "entry_id": entry.entry_id,
@@ -377,6 +394,50 @@ async def _info(hass, connection, msg) -> None:
             if (receiver := hass.data.get(CALENDAR_RECEIVERS, {}).get(entry.entry_id)) is not None
         ]
     operation.result(result)
+
+
+@websocket_api.websocket_command({"type": f"{_WS}/rename", "pairing_id": str, "label": str})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _rename(hass, connection, msg) -> None:
+    operation = _AdminOperation(hass, connection, msg)
+    if not operation.authorized:
+        return
+    try:
+        pairing_id = _uuid(msg["pairing_id"])
+        label = msg["label"].strip()
+        if len(label) > 64 or (label and not label.isprintable()):
+            operation.error("invalid_label")
+            return
+        async with operation.test.labels_lock:
+            active = {str(phone) for phone in await operation.test.registry.async_list_active()}
+            phone_id = str(pairing_id)
+            if phone_id not in active:
+                operation.error("phone_unavailable")
+                return
+            store = operation.test.labels
+            previous = await store.async_load()
+            if previous is None:
+                previous = {}
+            if not isinstance(previous, dict):
+                raise PairingError("Invalid phone labels")
+            labels = {
+                key: value for key, value in previous.items()
+                if key in active and isinstance(value, str)
+            }
+            if label:
+                labels[phone_id] = label
+            else:
+                labels.pop(phone_id, None)
+            if labels != previous:
+                if getattr(hass, "is_stopping", False):
+                    raise PairingError("Home Assistant is stopping")
+                await store.async_save(labels)
+                if await store.async_load() != labels:
+                    raise PairingError("Unable to persist phone labels")
+        operation.result({"state": "renamed"})
+    except (HomeAssistantError, OSError, ValueError):
+        operation.error("rename_unavailable")
 
 
 @websocket_api.websocket_command({
@@ -547,7 +608,8 @@ async def async_setup_local_pairing(
     if local_test or test.native is not None:
         for view in (_ClaimView, _StatusView, _ActivateView):
             server.register_view(view(test))
-    for command in (_invite, _status, _approve, _cancel, _info, _revoke):
+    test.labels = Store(hass, 1, f"{DOMAIN}.pairing_labels", private=True, atomic_writes=True)
+    for command in (_invite, _status, _approve, _cancel, _info, _rename, _revoke):
         websocket_api.async_register_command(hass, command)
     if universal:
         websocket_api.async_register_command(hass, _calendar_source)

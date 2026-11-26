@@ -50,3 +50,78 @@ Pour revenir à **0.3.0** depuis HACS, choisir `main` dans **Retélécharger →
 ## Étape 3C4C.5
 
 Valider l’installation au-dessus de 0.3.0 dans Home Assistant Container et la recette S25+ avec le proxy réel. Répéter sur NPM en conteneur avec configuration standard, puis sur une instance Home Assistant Link et un téléphone Android 8. Tester la reprise réelle WorkManager après Doze, redémarrage et transition Wi-Fi, réseau mobile ou VPN. Vérifier le retour au webhook, l’onglet Android des consentements et la conservation des identifiants. Relever les compatibilités observées avant toute publication.
+
+La reprise sur Galaxy S25+ est attestée par la recette physique fournie pour Android
+2.7.4 build 2 (`fe2a703da929`). Elle couvre l’association existante, la
+synchronisation automatique après modification, l’activation et la désactivation,
+le partage par réveil et l’indépendance des webhooks. Cette attestation sert de
+base au lot d’interface.
+
+## Étape 3C4C.6 — Panneau Home Assistant
+
+La branche locale `feature/3c4c6-native-ha-panel` part du tag
+`0.4.0-beta.1` (`247dd3e`). Le panneau reprend la navigation, les icônes et les
+variables de thème Home Assistant. Les formulaires et dialogues utilisent des
+contrôles HTML pour assurer le fonctionnement au clavier sans importer de
+composant frontend interne. La mise en page passe sur une colonne en vue étroite.
+
+- Le téléphone affiche son libellé Home Assistant ou un nom dérivé de son
+  identifiant, son état d’association et la dernière réception du calendrier
+  attribuable à cette liaison. La date décrit une réception passée. Les
+  associations actuelles ne conservent pas de nom système ni de modèle. Une
+  valeur provisoire envoyée lors de la demande Android tient lieu de libellé
+  dans le protocole existant. Un futur lot pourrait définir un champ de modèle
+  explicite, sa persistance et sa disponibilité pour les associations anciennes.
+- Le libellé est enregistré dans le Store privé `horeveil.pairing_labels` et
+  rattaché à l’identifiant d’association. Un champ vide rétablit le nom généré.
+  La commande réutilise le contrôle d’administration sécurisé et écrit seulement
+  dans ce Store. L’éligibilité dans le sélecteur correspond au profil signé déjà
+  exigé par le serveur.
+- L’invitation affiche le QR et le code manuel pendant l’attente du téléphone,
+  puis le code de comparaison et l’approbation dans HA, suivis de la confirmation
+  Android. Le code et le QR sont retirés quand ils cessent d’être utiles.
+  L’expiration et l’annulation rendent la création d’une nouvelle invitation
+  disponible.
+- Depuis HTTP, le panneau propose une adresse HTTPS interne ou externe
+  configurée dans Home Assistant et validée comme origine HTTPS. Le navigateur
+  reste responsable de la connexion et de la validation du certificat. Sans
+  origine exploitable, il indique où retrouver les réglages réseau.
+- La section Calendrier indique la source d’écriture par entrée et demande
+  confirmation avant le changement de source, qui efface sa projection. Le
+  webhook local demeure sélectionnable. Le téléphone gère le consentement au
+  calendrier et la sélection des réveils. La révocation exige une confirmation.
+
+### Vérifications du lot
+
+- 68 tests Python réussis sous Windows avec Python 3.13, aiohttp sur TLS et
+  un double de Home Assistant.
+  Les tests du lot couvrent le refus d’un administrateur en HTTP et d’un
+  non-admin, la validation du libellé, l’échec d’écriture, le redémarrage, la
+  conservation octet pour octet du registre, l’accès après renommage, la
+  révocation et l’éligibilité des profils. Les régressions existantes couvrent
+  aussi l’activation et la synchronisation signées, le rejeu, le changement de
+  source, les webhooks et la persistance de la projection.
+- Chrome 158 avec Playwright, API `hass` simulée et données de démonstration.
+  Rendu sur ordinateur à 1 200 px et mobile à 390 px, thèmes clair, sombre et
+  personnalisé. Le navigateur a exercé le QR avec le module embarqué et Web
+  Crypto, les confirmations, l’annulation, l’expiration, le renommage, les
+  deux sources, le dialogue de révocation au clavier et les deux variantes HTTP.
+  Les captures proviennent de ce banc. Le rendu dans le frontend Core et le
+  scan depuis l’application Android restent à confirmer avec ce panneau.
+
+### Recette courte sur une instance de validation
+
+1. Installer la branche sur une copie de recette de Home Assistant. Ouvrir
+   **Horéveil** avec un compte administrateur en HTTPS, sur ordinateur puis sur
+   mobile. Comparer les thèmes clair et sombre. Depuis l’accès HTTP, vérifier le
+   lien vers l’origine configurée ou l’aide réseau lorsque celle-ci manque.
+2. Renommer un téléphone déjà associé. Redémarrer Home Assistant, vérifier le
+   libellé et envoyer le calendrier depuis ce téléphone. Vérifier la mise à jour
+   de l’heure de réception et le consentement par réveil réglé sur Android.
+3. Sur une entrée de recette, choisir **Webhook local**, puis le téléphone
+   HTTPS. Confirmer chaque changement, vérifier l’effacement de la projection et
+   demander une livraison par la source choisie.
+4. Avec un téléphone de recette, créer et scanner une invitation, comparer les
+   codes, approuver dans HA puis confirmer sur Android. Essayer aussi
+   l’expiration et l’annulation d’une autre invitation. Révoquer uniquement le
+   téléphone de recette et vérifier que ses envois directs sont refusés.

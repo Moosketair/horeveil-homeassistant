@@ -750,11 +750,12 @@ class PairingRegistry:
             await _persist(write)
             return True
 
-    async def async_list_active(self) -> tuple[UUID, ...]:
+    async def async_list_active(self, *, signed_only: bool = False) -> tuple[UUID, ...]:
         """Return active association identifiers without credentials or labels."""
         async with self._lock:
             _ = self.server_id
             return tuple(
                 pairing_id for pairing_id, association in self._associations.items()
                 if association.state is AssociationState.ACTIVE
+                and (not signed_only or association.public_key is not None)
             )

@@ -129,6 +129,7 @@ class SignedPairingTests(unittest.IsolatedAsyncioTestCase):
     async def test_calendar_source_signature_duplicate_and_restart(self):
         installation, reply = await self.activate_calendar_phone()
         pairing_id = UUID(reply["pairing_id"])
+        self.assertEqual(await self.registry.async_list_active(signed_only=True), (pairing_id,))
         payload = self.calendar_payload(installation)
 
         async def publish(status, data=payload):

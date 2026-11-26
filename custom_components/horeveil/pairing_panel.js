@@ -4,105 +4,153 @@ const COMMAND = "horeveil/pairing_test/";
 
 const template = `
   <style>
-    :host { display:block; color:var(--primary-text-color); }
-    main { max-width:720px; margin:auto; padding:24px 16px; }
-    section { padding:20px; margin:16px 0; background:var(--card-background-color);
-      border:1px solid var(--divider-color); border-radius:12px; }
-    h1, h2 { margin:0 0 12px; } h2 { font-size:1.15rem; }
-    p { line-height:1.5; } label { display:block; margin:10px 0; }
-    input[type=url] { box-sizing:border-box; width:100%; padding:10px; font:inherit;
-      color:inherit; background:var(--secondary-background-color);
-      border:1px solid var(--divider-color); border-radius:6px; }
-    button { font:inherit; padding:8px 12px; margin:4px 8px 4px 0; border:1px solid var(--divider-color);
-      border-radius:6px; color:inherit; background:var(--secondary-background-color); cursor:pointer; }
-    button:disabled { opacity:.55; cursor:default; }
-    output, code, li { overflow-wrap:anywhere; }
-    #code, #comparison { font-size:1.15rem; letter-spacing:.08em; }
-    #qr { margin:16px 0; }
-    #qr-canvas { display:block; width:min(100%, 320px); height:auto; image-rendering:pixelated; }
-    fieldset { margin:12px 0; border:1px solid var(--divider-color); }
-    .muted { color:var(--secondary-text-color); }
-    [hidden] { display:none !important; }
+    :host { display: block; min-height: 100%; color: var(--primary-text-color);
+      background: var(--primary-background-color); font-family: var(--ha-font-family-body, inherit); }
+    header { display: flex; align-items: center; gap: 12px; min-height: var(--header-height, 56px);
+      padding: 0 16px; color: var(--app-header-text-color, var(--primary-text-color));
+      background: var(--app-header-background-color, var(--card-background-color));
+      border-bottom: 1px solid var(--divider-color); }
+    h1, h2, h3, p, figure, ul { margin: 0; }
+    h1 { font-size: var(--ha-font-size-xl, 1.25rem); font-weight: 500; }
+    h2 { font-size: var(--ha-font-size-l, 1.125rem); font-weight: 600; }
+    h3 { font-size: var(--ha-font-size-m, 1rem); font-weight: 600; overflow-wrap: anywhere; }
+    p, label, li { line-height: 1.5; }
+    main { max-width: 1100px; margin: auto; padding: 24px 20px; }
+    #content { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+    section { display: grid; gap: 16px; min-width: 0; padding: 20px;
+      background: var(--ha-card-background, var(--card-background-color));
+      border: var(--ha-card-border-width, 1px) solid var(--ha-card-border-color, var(--divider-color));
+      border-radius: var(--ha-card-border-radius, 12px); }
+    .heading, .actions, .check { display: flex; align-items: center; gap: 8px; }
+    .heading ha-icon { color: var(--primary-color); --mdc-icon-size: 22px; }
+    .actions { flex-wrap: wrap; }
+    .stack { display: grid; gap: 12px; }
+    .field { display: grid; gap: 6px; font-weight: 500; }
+    input:not([type=checkbox]), select { box-sizing: border-box; width: 100%; min-height: 44px;
+      padding: 8px 12px; font: inherit; color: inherit; background: var(--secondary-background-color);
+      border: 1px solid var(--divider-color); border-radius: var(--ha-border-radius-md, 8px); }
+    :host { color-scheme: var(--color-scheme, light dark); }
+    input[type=checkbox] { width: 18px; height: 18px; margin: 0; flex: none; accent-color: var(--primary-color); }
+    :is(button, a, input, select):focus-visible { outline: 2px solid var(--primary-color); outline-offset: 3px; }
+    button, .button { display: inline-flex; align-items: center; justify-content: center; min-height: 42px;
+      box-sizing: border-box; padding: 7px 14px; font: inherit; font-weight: 600; text-decoration: none;
+      color: var(--primary-text-color); background: transparent; border: 1px solid var(--divider-color);
+      border-radius: var(--ha-border-radius-lg, 12px); cursor: pointer; text-align: center; }
+    button:hover, .button:hover { background: var(--secondary-background-color); }
+    .primary, .primary:hover { background: var(--primary-color);
+      color: var(--primary-color-text, var(--text-primary-color)); border-color: transparent; }
+    .danger { color: var(--error-color); }
+    button:disabled { color: var(--disabled-text-color); background: var(--secondary-background-color); cursor: default; }
+    .muted { color: var(--secondary-text-color); }
+    #notice:not(:empty) { margin-bottom: 16px; }
+    #notice:not(:empty), #invitation { background: var(--secondary-background-color); padding: 12px 14px;
+      border-inline-start: 3px solid var(--primary-color); border-radius: var(--ha-border-radius-md, 8px); }
+    #notice[data-kind=error] { border-inline-start-color: var(--error-color); }
+    #notice[data-kind=success] { border-inline-start-color: var(--success-color); }
+    #network { margin-bottom: 16px; }
+    #phones { list-style: none; padding: 0; }
+    #phones > li, #calendar-entries > div { display: grid; gap: 8px; padding-block: 14px;
+      border-top: 1px solid var(--divider-color); }
+    #phones > li:last-child, #calendar-entries > div:last-child { padding-bottom: 0; }
+    #calendar-sources { grid-column: 1 / -1; }
+    #calendar-entries { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 16px; }
+    code, output, p { overflow-wrap: anywhere; }
+    #code, #comparison { font-size: 1.05rem; letter-spacing: .08em; }
+    #qr-canvas { display: block; width: min(100%, 248px); height: auto; image-rendering: pixelated; margin-bottom: 8px; }
+    dialog { box-sizing: border-box; width: min(456px, calc(100% - 32px)); max-height: calc(100% - 32px); padding: 24px;
+      color: var(--primary-text-color); background: var(--dialog-surface-background, var(--card-background-color));
+      border: 1px solid var(--divider-color); border-radius: var(--ha-card-border-radius, 12px); }
+    dialog::backdrop { background: var(--dialog-backdrop-filter-color, rgb(0 0 0 / 45%)); }
+    dialog .actions { justify-content: flex-end; }
+    :host([narrow]) #content { grid-template-columns: minmax(0, 1fr); }
+    @media (max-width: 700px) {
+      main { padding: 16px 12px; }
+      section { padding: 16px; }
+      #content { grid-template-columns: minmax(0, 1fr); }
+    }
+    [hidden] { display: none !important; }
   </style>
+  <header>
+    <ha-menu-button></ha-menu-button>
+    <h1>Horéveil</h1>
+  </header>
   <main>
-    <h1>Association Horéveil</h1>
-    <p id="notice" role="status">Chargement de l’association…</p>
+    <section id="network" aria-labelledby="network-title" hidden>
+      <h2 id="network-title">Accès HTTPS requis</h2>
+      <p>HTTPS protège la session d’administration et le code d’association. Ouvrez Home Assistant depuis une adresse HTTPS avec un certificat reconnu par votre navigateur.</p>
+      <p id="https-help" class="muted">Si vous ne disposez pas encore d’une adresse sécurisée, configurez-en une dans Home Assistant. Retrouvez les adresses de votre instance dans Paramètres → Système → Réseau.</p>
+      <div id="https-action" hidden><a id="https-link" class="button primary" rel="noreferrer">Ouvrir Horéveil en HTTPS</a></div>
+    </section>
+    <p id="notice" role="status">Chargement du panneau…</p>
+    <button id="retry" type="button" hidden>Réessayer</button>
     <div id="content" hidden>
-      <section aria-labelledby="add-title">
-        <h2 id="add-title">Ajouter un téléphone</h2>
-        <form id="address">
-          <label for="origin">Adresse HTTPS de Home Assistant</label>
-          <input id="origin" type="url" required autocomplete="off" spellcheck="false" list="https-origins">
-          <datalist id="https-origins"></datalist>
-          <p>Domaine ou hôte <output id="host" for="origin">—</output></p>
-          <p class="muted">L’adresse Internet configurée dans HA est une suggestion. Son accessibilité depuis le téléphone n’est pas vérifiée.</p>
-          <button id="local" type="button">Utiliser l’adresse de recette</button>
-          <button id="create" type="submit" disabled>Confirmer et créer l’invitation</button>
-        </form>
-        <p id="availability"></p>
-        <div id="direct" hidden>
-          <p id="direct-state"></p>
-          <label id="direct-confirm-label"><input id="direct-confirm" type="checkbox">
-            Je confirme l’origine et le relais HTTPS configuré.
-          </label>
-          <button id="direct-toggle" type="button" disabled>Activer l’accès direct</button>
-        </div>
-        <div id="invitation" hidden>
-          <p>État <strong id="state"></strong></p>
-          <p>Valable 5 minutes. Expiration <time id="expires"></time></p>
-          <div id="manual">
-            <p>Adresse <output id="invitation-origin"></output><br>Code manuel <code id="code"></code></p>
-            <figure id="qr" hidden>
-              <canvas id="qr-canvas" width="0" height="0" aria-label="QR temporaire d’association Horéveil"></canvas>
-              <figcaption>Scannez depuis Horéveil Android. La joignabilité HTTPS depuis le téléphone reste à vérifier.</figcaption>
-            </figure>
-            <p id="qr-unavailable" class="muted">La recette sur la boucle locale utilise le code manuel avec un simulateur sur cet hôte.</p>
-            <button id="regenerate" type="button">Régénérer l’invitation</button>
-          </div>
-          <div id="review" hidden>
-            <p>Code de sécurité <code id="comparison"></code></p>
-            <label><input id="compared" type="checkbox"> J’ai comparé le code avec celui affiché sur l’appareil.</label>
-            <button id="approve" type="button" disabled>Approuver</button>
-          </div>
-          <button id="cancel" type="button">Annuler l’invitation</button>
-        </div>
-      </section>
-      <section aria-labelledby="permissions-title">
-        <h2 id="permissions-title">Autorisations prévues</h2>
-        <p>Ces choix sont un aperçu. Ils ne sont pas enregistrés et n’accordent aucun droit pendant la recette.</p>
-        <label><input type="radio" name="mode" value="read" checked> Consultation seule</label>
-        <p class="muted">HA pourra lire uniquement les données explicitement autorisées.</p>
-        <label><input id="control-mode" type="radio" name="mode" value="control"> Consultation et contrôle</label>
-        <p class="muted">Chaque action autorisée pourra modifier les réglages ou occurrences sur le téléphone.</p>
-        <fieldset>
-          <legend>Données à partager</legend>
-          <label><input type="checkbox"> Calendrier</label>
-          <label><input type="checkbox"> Alarmes</label>
-          <label><input type="checkbox"> Catégories</label>
-          <label><input type="checkbox"> Modes</label>
-          <label><input type="checkbox"> Événements réels</label>
-        </fieldset>
-        <fieldset id="commands" disabled>
-          <legend>Actions à autoriser</legend>
-          <label><input type="checkbox"> Décaler une occurrence</label>
-          <label><input type="checkbox"> Sauter une occurrence</label>
-          <label><input type="checkbox"> Changer le mode d’une catégorie</label>
-          <label><input type="checkbox"> Activer ou désactiver une alarme</label>
-        </fieldset>
-      </section>
       <section aria-labelledby="phones-title">
-        <h2 id="phones-title">Téléphones associés</h2>
-        <button id="refresh" type="button">Actualiser la liste</button>
+        <div class="heading"><ha-icon icon="mdi:cellphone" aria-hidden="true"></ha-icon><h2 id="phones-title">Téléphones associés</h2></div>
         <p id="empty">Aucun téléphone associé.</p>
-        <ul id="phones"></ul>
+        <ul id="phones" hidden></ul>
+        <div><button id="refresh" type="button">Actualiser la liste</button></div>
+      </section>
+      <section aria-labelledby="add-title">
+        <div class="heading"><ha-icon icon="mdi:qrcode-scan" aria-hidden="true"></ha-icon><h2 id="add-title">Associer un téléphone</h2></div>
+        <form id="address" class="stack">
+          <label class="field" for="origin">Adresse HTTPS de Home Assistant
+            <input id="origin" type="url" required autocomplete="off" spellcheck="false" list="https-origins" aria-describedby="availability">
+          </label>
+          <datalist id="https-origins"></datalist>
+          <p id="availability" class="muted"></p>
+          <div id="direct" class="stack" hidden>
+            <p id="direct-state"></p>
+            <label id="direct-confirm-label" class="check"><input id="direct-confirm" type="checkbox">
+              Je confirme l’origine et le relais HTTPS configuré.
+            </label>
+            <div><button id="direct-toggle" type="button" disabled>Activer l’accès direct</button></div>
+          </div>
+          <div class="actions">
+            <button id="create" class="primary" type="submit" disabled>Créer une invitation</button>
+            <button id="local" type="button">Utiliser l’adresse de recette</button>
+          </div>
+        </form>
+        <div id="invitation" class="stack" hidden>
+          <h3 id="state" role="status"></h3>
+          <p>Validité de cinq minutes · Expire à <time id="expires"></time></p>
+          <div id="manual" class="stack">
+            <figure id="qr" hidden>
+              <canvas id="qr-canvas" width="0" height="0" role="img" aria-label="QR temporaire d’association Horéveil"></canvas>
+              <figcaption>Dans Horéveil Android, ouvrez Réglages → Intégrations → Home Assistant et scannez le QR code.</figcaption>
+            </figure>
+            <p id="qr-unavailable" class="muted"></p>
+            <p>Adresse <output id="invitation-origin"></output><br>Code de saisie manuelle <code id="code"></code></p>
+            <div><button id="regenerate" type="button">Régénérer l’invitation</button></div>
+          </div>
+          <div id="review" class="stack" hidden>
+            <p>Comparez ce code avec celui affiché sur le téléphone. <strong><code id="comparison"></code></strong></p>
+            <label class="check"><input id="compared" type="checkbox"> Les deux codes sont identiques.</label>
+            <div><button id="approve" class="primary" type="button" disabled>Approuver dans Home Assistant</button></div>
+          </div>
+          <p id="android-confirm" hidden>Confirmez maintenant l’association dans Horéveil Android.</p>
+          <div><button id="cancel" type="button">Annuler l’invitation</button></div>
+        </div>
       </section>
       <section id="calendar-sources" aria-labelledby="calendar-sources-title" hidden>
-        <h2 id="calendar-sources-title">Synchronisation du calendrier</h2>
-        <p>Choisissez la source autorisée pour chaque entrée. Le téléphone doit aussi autoriser le partage. Changer de source efface la projection affichée.</p>
+        <div class="heading"><ha-icon icon="mdi:calendar-sync" aria-hidden="true"></ha-icon><h2 id="calendar-sources-title">Synchronisation du calendrier</h2></div>
+        <p>Une seule source peut écrire dans chaque calendrier. Pour un téléphone associé, le partage du calendrier et le choix des réveils se règlent dans Horéveil Android.</p>
         <div id="calendar-entries"></div>
       </section>
     </div>
-  </main>`;
+  </main>
+  <dialog id="dialog" aria-labelledby="dialog-title" aria-describedby="dialog-description">
+    <form id="dialog-form" class="stack">
+      <h2 id="dialog-title"></h2>
+      <p id="dialog-description"></p>
+      <label id="label-field" class="field" for="phone-label" hidden>Libellé du téléphone
+        <input id="phone-label" maxlength="64" autocomplete="off">
+      </label>
+      <div class="actions">
+        <button id="dismiss" type="button">Annuler</button>
+        <button id="confirm" type="submit"></button>
+      </div>
+    </form>
+  </dialog>`;
 
 function parseOrigin(value) {
   if (!/^https:\/\/[^/?#\\\s]+\/?$/i.test(value)) return null;
@@ -112,6 +160,15 @@ function parseOrigin(value) {
   } catch {
     return null;
   }
+}
+
+function actionButton(title, action, className = "") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = title;
+  button.onclick = action;
+  return button;
 }
 
 function drawInvitationQr(canvas, origin, code, expiresAt) {
@@ -167,6 +224,8 @@ class HoreveilAssociation extends HTMLElement {
   #httpsOrigins;
   #configuredOrigin;
   #loaded = false;
+  #polling;
+  #dialogAction;
   #invitation;
   #timer;
   #expiryTimer;
@@ -193,27 +252,44 @@ class HoreveilAssociation extends HTMLElement {
     this.#element("approve").onclick = () => this.#decide(true);
     this.#element("cancel").onclick = () => this.#decide(false);
     this.#element("regenerate").onclick = () => this.#regenerate();
-    this.#element("refresh").onclick = () => this.#run((generation) => this.#load(generation));
-    this.#element("content").addEventListener("change", (event) => {
-      if (event.target.name !== "mode") return;
-      const commands = this.#element("commands");
-      commands.disabled = !this.#element("control-mode").checked;
-      if (commands.disabled) for (const option of commands.querySelectorAll("input")) option.checked = false;
+    this.#element("refresh").onclick = () => this.#refresh();
+    this.#element("retry").onclick = () => this.#refresh();
+    const dialog = this.#element("dialog");
+    this.#element("dismiss").onclick = () => dialog.close();
+    this.#element("dialog-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const action = this.#dialogAction;
+      const label = this.#element("phone-label").value;
+      this.#dialogAction = undefined;
+      dialog.close();
+      action?.(label);
     });
+    dialog.addEventListener("close", () => {
+      this.#dialogAction = undefined;
+      this.#element("phone-label").value = "";
+    });
+  }
+
+  set narrow(value) {
+    this.toggleAttribute("narrow", Boolean(value));
   }
 
   set hass(value) {
     this.#hass = value;
     const user = value?.user;
     const admin = user?.is_admin && value.connected !== false ? user.id : undefined;
-    if (admin === this.#admin) return;
-    this.#reset();
-    this.#admin = admin;
-    if (this.isConnected && admin) this.#run((generation) => this.#load(generation));
+    this.#network(Boolean(admin));
+    if (admin !== this.#admin) {
+      this.#reset();
+      this.#admin = admin;
+      if (this.isConnected && admin && location.protocol === "https:") this.#refresh();
+    }
   }
 
   connectedCallback() {
-    if (this.#admin) this.#run((generation) => this.#load(generation));
+    this.#network(Boolean(this.#admin));
+    if (this.#admin && location.protocol === "https:") this.#refresh();
+    if (location.protocol !== "https:") this.#notice("");
     this.#timer = setInterval(() => this.#poll(), 2000);
   }
 
@@ -226,8 +302,29 @@ class HoreveilAssociation extends HTMLElement {
     return this.shadowRoot.getElementById(id);
   }
 
-  #notice(message) {
-    this.#element("notice").textContent = message;
+  #notice(message, kind = "") {
+    const notice = this.#element("notice");
+    notice.dataset.kind = kind;
+    notice.textContent = message;
+  }
+
+  #network(admin) {
+    const insecure = location.protocol !== "https:";
+    const config = this.#hass?.config;
+    const origin = admin && insecure && [config?.external_url, config?.internal_url]
+      .map((value) => parseOrigin(value ?? "")).find(Boolean);
+    const link = this.#element("https-link");
+    if (origin) link.href = new URL("/horeveil-association", origin).href;
+    else link.removeAttribute("href");
+    this.#element("https-action").hidden = !origin;
+    this.#element("https-help").hidden = Boolean(origin);
+    this.#element("network").hidden = !insecure;
+  }
+
+  #refresh() {
+    if (!this.#loaded) this.#notice("Chargement du panneau…");
+    this.#run((generation) => this.#load(generation),
+      "Impossible de charger le panneau. Vérifiez votre session puis réessayez.");
   }
 
   #reset() {
@@ -240,13 +337,19 @@ class HoreveilAssociation extends HTMLElement {
     this.#element("https-origins").replaceChildren();
     this.#configuredOrigin = undefined;
     this.#loaded = false;
+    this.#element("phones").inert = false;
+    this.#element("calendar-entries").inert = false;
+    this.#polling = undefined;
+    this.#dialogAction = undefined;
+    this.#element("dialog").close();
+    this.#element("retry").hidden = true;
     this.#element("direct-confirm").checked = false;
     this.#dropInvitation();
     this.#element("content").hidden = true;
     this.#element("origin").value = "";
     this.#element("phones").replaceChildren();
     this.#element("calendar-entries").replaceChildren();
-    this.#notice("Accès réservé à un administrateur connecté en HTTPS.");
+    this.#notice(location.protocol === "https:" ? "Connectez-vous en tant qu’administrateur." : "");
   }
 
   #dropInvitation() {
@@ -254,6 +357,7 @@ class HoreveilAssociation extends HTMLElement {
     this.#invitation = undefined;
     this.#element("code").textContent = "";
     this.#element("comparison").textContent = "";
+    this.#element("invitation-origin").textContent = "";
     this.#element("compared").checked = false;
     this.#invitationState();
   }
@@ -263,19 +367,29 @@ class HoreveilAssociation extends HTMLElement {
   }
 
   async #run(operation, fallback = "Opération indisponible.") {
-    if (this.#busy || !this.#admin || !this.isConnected) return;
+    if (this.#busy || !this.#admin || !this.isConnected || location.protocol !== "https:") return;
     const generation = this.#generation;
     this.#busy = true;
+    this.#element("retry").hidden = true;
+    this.#element("phones").inert = true;
+    this.#element("calendar-entries").inert = true;
     this.#invitationState();
     try {
       await operation(generation);
     } catch (error) {
       if (generation !== this.#generation) return;
-      if (error?.code === "unauthorized") this.#reset();
-      else this.#notice(fallback);
+      if (error?.code === "unauthorized") {
+        this.#reset();
+        this.#notice("Home Assistant a refusé la session d’administration HTTPS.", "error");
+      } else {
+        this.#notice(fallback, "error");
+      }
+      this.#element("retry").hidden = this.#loaded;
     } finally {
       if (generation === this.#generation) {
         this.#busy = false;
+        this.#element("phones").inert = false;
+        this.#element("calendar-entries").inert = false;
         this.#invitationState();
       }
     }
@@ -284,9 +398,8 @@ class HoreveilAssociation extends HTMLElement {
   #address() {
     const parsed = parseOrigin(this.#element("origin").value.trim());
     const usable = parsed && (this.#httpsOrigins ?? [this.#testOrigin, this.#directOrigin]).includes(parsed.origin);
-    this.#element("host").textContent = parsed?.host ?? "—";
     this.#element("availability").textContent = usable
-      ? "Adresse autorisée pour créer une invitation. La joignabilité n’est pas vérifiée."
+      ? "Cette adresse doit aussi être accessible depuis votre téléphone."
       : this.#httpsOrigins
         ? (this.#httpsOrigins.length ? "Choisissez une adresse HTTPS proposée par Home Assistant."
           : "Home Assistant ne propose aucune adresse HTTPS pour le téléphone.")
@@ -294,6 +407,8 @@ class HoreveilAssociation extends HTMLElement {
         ? `Confirmez l’adresse configurée pour le relais HTTPS (${this.#configuredOrigin}).`
       : "Choisissez une adresse de recette ou confirmez le relais HTTPS avant de créer une invitation.";
     this.#element("local").hidden = !this.#testOrigin;
+    this.#element("local").disabled = this.#busy || Boolean(this.#invitation);
+    this.#element("origin").readOnly = Boolean(this.#invitation);
     this.#element("direct").hidden = !this.#directConfigured;
     this.#element("direct-state").textContent = this.#directOrigin
       ? `Accès direct actif sur ${this.#directOrigin}` : "Accès direct désactivé";
@@ -304,6 +419,7 @@ class HoreveilAssociation extends HTMLElement {
       !parsed || parsed.origin === this.#testOrigin || !this.#element("direct-confirm").checked
       || (this.#configuredOrigin && parsed.origin !== this.#configuredOrigin)
     ));
+    this.#element("refresh").disabled = this.#busy;
     this.#element("create").disabled = !usable || this.#busy || Boolean(this.#invitation);
     return usable ? parsed.origin : null;
   }
@@ -324,57 +440,121 @@ class HoreveilAssociation extends HTMLElement {
     }));
     this.#configuredOrigin = info.configured_origin;
     this.#element("content").hidden = false;
+    const calendars = info.calendars ?? [];
+    const eligible = new Set(info.calendar_phones ?? []);
+    const name = (id) => info.phone_labels?.[id] ?? `Téléphone ${id.slice(0, 8)}`;
+    const phones = this.#element("phones");
     this.#element("empty").hidden = info.phones.length > 0;
-    this.#element("phones").replaceChildren(...info.phones.map((id) => {
+    phones.hidden = !info.phones.length;
+    phones.replaceChildren(...info.phones.map((id) => {
       const item = document.createElement("li");
-      const button = document.createElement("button");
-      button.type = "button";
-      button.textContent = "Révoquer";
-      button.setAttribute("aria-label", `Révoquer le téléphone ${id}`);
-      button.onclick = () => this.#revoke(id);
-      item.append(`Téléphone ${id} `, button);
+      const title = document.createElement("h3");
+      title.textContent = name(id);
+      const details = document.createElement("p");
+      details.className = "muted";
+      details.textContent = "Associé · Modèle indisponible";
+      const sync = document.createElement("p");
+      const receipts = calendars.filter((entry) => entry.pairing_id === id && entry.last_success);
+      const last = Math.max(...receipts.map((entry) => Date.parse(entry.last_success)));
+      sync.textContent = Number.isFinite(last)
+        ? `Dernière réception du calendrier le ${new Date(last).toLocaleString()}`
+        : "Aucune réception du calendrier disponible pour ce téléphone.";
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      const rename = actionButton("Renommer", () => this.#rename(id, info.phone_labels?.[id]));
+      const revoke = actionButton("Révoquer", () => this.#revoke(id, name(id)), "danger");
+      rename.setAttribute("aria-label", `Renommer ${name(id)}`);
+      revoke.setAttribute("aria-label", `Révoquer ${name(id)}`);
+      actions.append(rename, revoke);
+      item.append(title, details, sync, actions);
       return item;
     }));
-    this.#element("calendar-sources").hidden = !info.calendars?.length;
-    this.#element("calendar-entries").replaceChildren(...(info.calendars ?? []).map((entry) => {
+    this.#element("calendar-sources").hidden = !calendars.length;
+    this.#element("calendar-entries").replaceChildren(...calendars.map((entry) => {
       const row = document.createElement("div");
+      const title = document.createElement("h3");
+      title.textContent = entry.title;
+      const current = document.createElement("p");
       const label = document.createElement("label");
+      label.className = "field";
       const select = document.createElement("select");
-      const choices = [["", "Webhook local"], ...info.phones.map((id) => [id, `Téléphone ${id}`])];
-      if (entry.pairing_id && !info.phones.includes(entry.pairing_id)) {
-        choices.push([entry.pairing_id, "Source révoquée · écritures bloquées"]);
+      const selected = entry.pairing_id ?? "";
+      const choices = new Map([["", "Webhook local"]]);
+      for (const id of eligible) {
+        if (id !== selected && calendars.some((other) => other !== entry && other.pairing_id === id)) continue;
+        choices.set(id, `${name(id)} · HTTPS direct`);
       }
+      if (!choices.has(selected)) choices.set(selected, "Téléphone indisponible · écritures bloquées");
+      current.textContent = `Source active · ${choices.get(selected)}`;
       for (const [value, title] of choices) {
         const option = document.createElement("option");
         option.value = value;
         option.textContent = title;
         select.append(option);
       }
-      select.value = entry.pairing_id ?? "";
-      label.append(`${entry.title} · source active `, select);
-      const save = document.createElement("button");
-      save.type = "button";
-      save.textContent = "Autoriser cette source";
-      save.disabled = true;
-      select.onchange = () => { save.disabled = select.value === (entry.pairing_id ?? ""); };
-      save.onclick = () => {
-        if (!window.confirm("Changer la source et effacer la projection actuelle ?")) return;
-        this.#run(async (generation) => {
-          await this.#call("calendar_source", {
-            entry_id: entry.entry_id, pairing_id: select.value || null, confirmed: true,
-          });
-          await this.#load(generation);
+      select.value = selected;
+      select.setAttribute("aria-label", `Nouvelle source pour ${entry.title}`);
+      label.append("Nouvelle source", select);
+      const save = actionButton("Changer la source", () => {
+        const next = select.value;
+        this.#showDialog({
+          title: "Changer la source du calendrier",
+          description: `Le calendrier « ${entry.title} » utilisera ${choices.get(next)}. La projection actuelle sera effacée jusqu’à la prochaine réception.`,
+          button: "Changer la source",
+          action: () => this.#run(async (generation) => {
+            await this.#call("calendar_source", { entry_id: entry.entry_id, pairing_id: next || null, confirmed: true });
+            if (generation !== this.#generation) return;
+            await this.#load(generation);
+            if (generation === this.#generation) this.#notice("Source du calendrier mise à jour.", "success");
+          }, "Impossible de changer la source du calendrier. Actualisez la liste puis réessayez."),
         });
-      };
+      });
+      save.disabled = true;
+      select.onchange = () => { save.disabled = select.value === selected; };
       const last = document.createElement("p");
+      last.className = "muted";
       last.textContent = entry.last_success
-        ? `Dernière réception réussie · ${new Date(entry.last_success).toLocaleString()}`
+        ? `Dernière réception réussie le ${new Date(entry.last_success).toLocaleString()}`
         : "Aucune réception pour cette source.";
-      row.append(label, save, last);
+      const actions = document.createElement("div");
+      actions.append(save);
+      row.append(title, current, last, label, actions);
       return row;
     }));
     this.#notice("");
     return info.phones;
+  }
+
+  #showDialog({ title, description, button, action, label, destructive = false }) {
+    if (this.#busy) return;
+    const dialog = this.#element("dialog");
+    const renaming = label !== undefined;
+    this.#element("label-field").hidden = !renaming;
+    const input = this.#element("phone-label");
+    input.value = label ?? "";
+    this.#element("dialog-title").textContent = title;
+    this.#element("dialog-description").textContent = description;
+    const confirm = this.#element("confirm");
+    confirm.textContent = button;
+    confirm.className = destructive ? "danger" : "primary";
+    this.#dialogAction = action;
+    dialog.showModal();
+    (renaming ? input : this.#element("dismiss")).focus();
+  }
+
+  #rename(id, label = "") {
+    this.#showDialog({
+      title: "Renommer le téléphone",
+      description: "Le libellé est enregistré dans Home Assistant. Laissez le champ vide pour rétablir le nom généré.",
+      button: "Enregistrer",
+      label,
+      action: (value) => this.#run(async (generation) => {
+        await this.#call("rename", { pairing_id: id, label: value });
+        if (generation !== this.#generation) return;
+        await this.#load(generation);
+        if (generation === this.#generation) this.#notice("Libellé du téléphone enregistré.", "success");
+      }, "Impossible d’enregistrer le libellé. Utilisez au maximum 64 caractères imprimables."),
+    });
   }
 
   #toggleDirect() {
@@ -420,7 +600,9 @@ class HoreveilAssociation extends HTMLElement {
     this.#element("invitation-origin").textContent = invitation.origin;
     this.#element("code").textContent = code;
     this.#element("expires").dateTime = invitation.expires_at;
-    this.#element("expires").textContent = new Date(expiration).toLocaleString();
+    this.#element("expires").textContent = new Date(expiration).toLocaleTimeString([], {
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
     if (this.#httpsOrigins?.includes(invitation.origin) || invitation.origin === this.#directOrigin) {
       const drawn = drawInvitationQr(this.#element("qr-canvas"), invitation.origin, code, invitation.expires_at);
       this.#element("qr").hidden = !drawn;
@@ -428,7 +610,7 @@ class HoreveilAssociation extends HTMLElement {
     this.#expiryTimer = setTimeout(
       () => this.#expire(invitation), Math.max(0, Math.min(300_000, expiration - Date.now())),
     );
-    this.#notice("");
+    this.#notice("Invitation créée. Elle est valable cinq minutes.", "success");
   }
 
   #regenerate() {
@@ -444,8 +626,12 @@ class HoreveilAssociation extends HTMLElement {
 
   #expire(invitation) {
     if (this.#invitation !== invitation) return;
+    if (invitation.state === "approved") {
+      this.#poll();
+      return;
+    }
     this.#dropInvitation();
-    this.#notice("Invitation expirée.");
+    this.#notice("Invitation expirée. Créez une nouvelle invitation pour recommencer.", "error");
   }
 
   #invitationState() {
@@ -467,49 +653,66 @@ class HoreveilAssociation extends HTMLElement {
       : "La recette sur la boucle locale utilise le code manuel avec un simulateur sur cet hôte.";
     this.#element("regenerate").disabled = this.#busy;
     this.#element("review").hidden = !reviewing;
-    this.#element("state").textContent = {
-      issued: "En attente de demande", awaiting_approval: "À vérifier",
-      approved: "Approuvée, en attente de confirmation du client",
+    this.#element("android-confirm").hidden = state !== "approved";
+    const stateText = {
+      issued: "En attente du téléphone", awaiting_approval: "Code de sécurité à vérifier",
+      approved: "En attente de confirmation sur Android",
     }[state] ?? "";
+    if (this.#element("state").textContent !== stateText) this.#element("state").textContent = stateText;
     this.#element("cancel").textContent = reviewing ? "Refuser la demande" : "Annuler l’invitation";
     this.#element("cancel").disabled = this.#busy;
     this.#element("approve").disabled = this.#busy || !reviewing || !this.#element("compared").checked;
     this.#address();
   }
 
-  #poll() {
+  async #poll() {
     const invitation = this.#invitation;
-    if (!invitation) return;
-    if (Date.now() >= Date.parse(invitation.expires_at)) {
+    if (!invitation || this.#busy || this.#polling) return;
+    const expired = Date.now() >= Date.parse(invitation.expires_at);
+    if (expired && invitation.state !== "approved") {
       this.#expire(invitation);
       return;
     }
-    this.#run(async (generation) => {
-      let result;
-      try {
-        result = await this.#call("status", {
-          invitation_id: invitation.invitation_id, display_key: invitation.key.publicKey,
-        });
-      } catch (error) {
-        if (error?.code !== "invitation_unavailable") throw error;
-        if (generation !== this.#generation || this.#invitation !== invitation) return;
-        this.#dropInvitation();
-        const phones = await this.#load(generation);
-        if (generation === this.#generation) {
-          this.#notice(phones.includes(invitation.pairing_id) ? "Téléphone associé." : "Invitation indisponible.");
-        }
-        return;
-      }
-      if (generation !== this.#generation || this.#invitation !== invitation || result.state === invitation.state) return;
+    const generation = this.#generation;
+    const state = invitation.state;
+    const current = () => generation === this.#generation && this.#invitation === invitation
+      && invitation.state === state && !this.#busy;
+    this.#polling = invitation;
+    try {
+      const result = await this.#call("status", {
+        invitation_id: invitation.invitation_id, display_key: invitation.key.publicKey,
+      });
+      if (!current() || result.state === state) return;
       const comparison = result.state === "awaiting_approval"
         ? await decrypt(invitation.key.privateKey, result.comparison_code_encrypted) : "";
-      if (generation !== this.#generation || this.#invitation !== invitation) return;
+      if (!current()) return;
       invitation.state = result.state;
       invitation.pairing_id = result.pairing_id;
       this.#element("code").textContent = "";
       this.#element("comparison").textContent = comparison;
       this.#element("compared").checked = false;
-    });
+      this.#notice("");
+      this.#invitationState();
+    } catch (error) {
+      if (!current()) return;
+      if (error?.code === "invitation_unavailable") {
+        this.#run(async (generation) => {
+          const phones = await this.#load(generation);
+          if (generation !== this.#generation || this.#invitation !== invitation) return;
+          this.#dropInvitation();
+          if (phones.includes(invitation.pairing_id)) this.#notice("Téléphone associé.", "success");
+          else this.#notice("Invitation terminée ou expirée. Créez une nouvelle invitation pour recommencer.", "error");
+        }, "Impossible de vérifier le résultat de l’association. Nouvelle tentative en cours.");
+      } else if (error?.code === "unauthorized") {
+        this.#reset();
+        this.#notice("Home Assistant a refusé la session d’administration HTTPS.", "error");
+        this.#element("retry").hidden = false;
+      } else {
+        this.#notice("Impossible de vérifier l’état de l’invitation. Nouvelle tentative en cours.", "error");
+      }
+    } finally {
+      if (this.#polling === invitation) this.#polling = undefined;
+    }
   }
 
   #decide(approve) {
@@ -526,18 +729,23 @@ class HoreveilAssociation extends HTMLElement {
         this.#element("compared").checked = false;
       } else {
         this.#dropInvitation();
-        this.#notice("Invitation annulée.");
+        this.#notice("Invitation annulée. Vous pouvez en créer une nouvelle.");
       }
-    });
+    }, "Impossible de traiter l’invitation. Vérifiez son état ou créez-en une nouvelle après expiration.");
   }
 
-  #revoke(id) {
-    if (!window.confirm(`Révoquer l’accès du téléphone ${id} ?`)) return;
-    this.#run(async (generation) => {
-      await this.#call("revoke", { pairing_id: id, confirmed: true });
-      if (generation !== this.#generation) return;
-      await this.#load(generation);
-      if (generation === this.#generation) this.#notice("Accès révoqué.");
+  #revoke(id, name) {
+    this.#showDialog({
+      title: `Révoquer ${name} ?`,
+      description: "Le téléphone perdra son accès et les données de calendrier reçues de ce téléphone seront retirées. Pour le reconnecter, vous devrez refaire l’association.",
+      button: "Révoquer le téléphone",
+      destructive: true,
+      action: () => this.#run(async (generation) => {
+        await this.#call("revoke", { pairing_id: id, confirmed: true });
+        if (generation !== this.#generation) return;
+        await this.#load(generation);
+        if (generation === this.#generation) this.#notice("Accès du téléphone révoqué.", "success");
+      }, "Impossible de confirmer la révocation. Actualisez la liste pour vérifier l’état du téléphone."),
     });
   }
 }
