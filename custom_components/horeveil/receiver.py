@@ -1,6 +1,7 @@
 """Serialize snapshot updates and serve the local webhook."""
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from http import HTTPStatus
 from secrets import compare_digest
@@ -235,7 +236,10 @@ class SnapshotReceiver:
             async_dispatcher_send(self._hass, self.update_signal)
             return _reply(HTTPStatus.OK, "accepted")
 
-    async def async_handle_direct(self, body: bytes, pairing_id: UUID, installation_id: UUID) -> web.Response:
+    async def async_handle_direct(
+        self, body: bytes, pairing_id: UUID, installation_id: UUID, *,
+        on_accepted: Callable[[Snapshot], Awaitable[None]] | None = None,
+    ) -> web.Response:
         """Accept a verified association's snapshot while its registry lock is held."""
         if self.direct_source != pairing_id:
             return _reply(HTTPStatus.FORBIDDEN, "source_not_authorized")
@@ -247,7 +251,11 @@ class SnapshotReceiver:
             return _reply(HTTPStatus.FORBIDDEN, "different_installation")
         if snapshot.expired_at(datetime.now(UTC)):
             return _reply(HTTPStatus.CONFLICT, "expired_snapshot")
-        return await self._commit(snapshot, pairing_id)
+        response = await self._commit(snapshot, pairing_id)
+        if (on_accepted is not None and response.status == HTTPStatus.OK
+                and self._last is not None and snapshot.raw == self._last.raw):
+            await on_accepted(snapshot)
+        return response
 
     async def async_handle(self, _hass, _webhook_id, request: web.Request) -> web.Response:
         """Authenticate and validate before committing any state."""

@@ -574,10 +574,11 @@ class PairingRegistry:
 
     async def async_direct_request(
         self, pairing_id: UUID, secret: bytes, operation: SignedOperation, verify: VerifySignature,
-        *, enrollment: Enrollment | None = None,
+        *, enrollment: Enrollment | None = None, on_active_status: Callable[[], Awaitable[None]] | None = None,
     ) -> PairingStatus:
         """Bind enrollment, signed confirmation and revocation under one lock."""
-        if len(secret) != 32 or operation not in {"enroll", "status", "activate", "cancel"}:
+        if (len(secret) != 32 or operation not in {"enroll", "status", "activate", "cancel"}
+                or on_active_status is not None and operation != "status"):
             raise InvalidPairingCredential("Invalid pairing credential")
         digest = sha256(secret).digest()
         async with self._lock:
@@ -588,7 +589,11 @@ class PairingRegistry:
                         or not compare_digest(active.credential_digest, digest) or operation not in {"status", "activate"}):
                     raise InvalidPairingCredential("Pairing unavailable")
                 await self._consume_nonce(pairing_id, *verify(active.public_key, active.origin, server_id))
+                if on_active_status is not None:
+                    await _persist(on_active_status)
                 return PairingStatus.ACTIVE
+            if on_active_status is not None:
+                raise InvalidPairingCredential("Pairing unavailable")
             invitation_id, pending, reservation = self._find_reservation(pairing_id)
             claim = reservation.claim
             if not pending.direct or not compare_digest(claim.credential_digest, digest):
@@ -757,6 +762,15 @@ class PairingRegistry:
 
             await _persist(write)
             return True
+
+    async def async_clean_revoked(self, clean: Callable[[tuple[UUID, ...]], Awaitable[None]]) -> None:
+        """Retry display data cleanup while excluding concurrent association operations."""
+        async with self._lock:
+            _ = self.server_id
+            await clean(tuple(
+                pairing_id for pairing_id, association in self._associations.items()
+                if association.state is AssociationState.REVOKED
+            ))
 
     async def async_list_active(self, *, signed_only: bool = False) -> tuple[UUID, ...]:
         """Return active association identifiers without credentials or labels."""

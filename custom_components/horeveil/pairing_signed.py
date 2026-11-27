@@ -14,13 +14,19 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, load_der_public_key
 from http_message_signatures import HTTPMessageVerifier, HTTPSignatureKeyResolver, InvalidSignature, algorithms
 
-from .pairing import InvalidPairingCredential, PairingClockSkew
-from .pairing_http import PairingHttp, _InvalidRequest, _credential, _decode_32, _read_json, _single_header, _uuid
+from .pairing import InvalidPairingCredential, PairingClockSkew, PairingStatus
+from .pairing_http import (
+    PairingHttp, _InvalidRequest, _credential, _decode_32, _read_json, _response, _single_header, _uuid,
+)
+from .phone_metadata import MAX_REVISION, PhoneMetadataStore
 from .receiver import SnapshotRequestError, _reply, async_read_snapshot_body
 
 DIRECT_BASE = "/api/horeveil/direct/v1"
 _COMPONENTS = ("@method", "@target-uri", "content-type", "content-digest", "horeveil-server-id")
 _FIELDS = {"claim_id", "installation_id", "pairing_id", "server_id", "challenge", "public_key_spki"}
+_METADATA_FIELDS = {"phone_metadata", "calendar_revision"}
+_METADATA_CAPABILITY = "Horeveil-Phone-Metadata"
+_METADATA_RESULT = "Horeveil-Phone-Metadata-Result"
 _SPKI = re.compile(r"[A-Za-z0-9_-]{122}", re.ASCII)
 _DIGEST = re.compile(r"sha-256=:[A-Za-z0-9+/]{43}=:", re.ASCII)
 
@@ -84,8 +90,9 @@ def _source(request):
 
 
 class SignedPairingHttp(PairingHttp):
-    def __init__(self, registry):
+    def __init__(self, registry, phone_metadata: PhoneMetadataStore):
         super().__init__(registry, local_source=_source, direct=True)
+        self._phone_metadata = phone_metadata
 
     async def calendar(self, request: web.Request, hass, find_receiver) -> web.Response:
         async def handler(request):
@@ -104,7 +111,13 @@ class SignedPairingHttp(PairingHttp):
                 receiver = await find_receiver(pairing_id)
                 if receiver is None:
                     return _reply(HTTPStatus.FORBIDDEN, "source_not_authorized")
-                return await receiver.async_handle_direct(body, pairing_id, association.installation_id)
+
+                async def record(snapshot):
+                    await self._phone_metadata.async_update(pairing_id, snapshot.phone_metadata, snapshot.revision)
+
+                return await receiver.async_handle_direct(
+                    body, pairing_id, association.installation_id, on_accepted=record,
+                )
 
             task = hass.async_create_task(self._registry.async_publish_calendar(pairing_id, secret, verify, publish))
             try:
@@ -122,8 +135,23 @@ class SignedPairingHttp(PairingHttp):
                 raise _InvalidRequest
             pairing_id, secret = _credential(request)
             fields = _FIELDS if operation == "enroll" else {"confirmed"} if operation == "activate" else set()
-            payload, body = await _read_json(request, fields)
+            payload, body = await _read_json(
+                request, fields, alternative_fields=_METADATA_FIELDS if operation == "status" else None,
+            )
             enrollment = None
+            on_active_status = None
+            metadata_result = None
+            if "phone_metadata" in payload:
+                revision = payload["calendar_revision"]
+                if type(revision) is not int or not 0 <= revision <= MAX_REVISION:
+                    raise _InvalidRequest
+
+                async def on_active_status():
+                    nonlocal metadata_result
+                    metadata_result = await self._phone_metadata.async_update(
+                        pairing_id, payload["phone_metadata"], revision, via_status=True,
+                    )
+
             if operation == "activate" and payload["confirmed"] is not True:
                 raise _InvalidRequest
             if operation == "enroll":
@@ -141,8 +169,15 @@ class SignedPairingHttp(PairingHttp):
             def verify(key, origin, server_id):
                 return _verify(request, body, operation, pairing_id, key, origin, server_id)
 
-            state = await self._registry.async_direct_request(pairing_id, secret, operation, verify, enrollment=enrollment)
-            return {"pairing_id": str(pairing_id), "server_id": str(self._registry.server_id),
-                    "state": state.value, "profile": "signed-v1"}
+            state = await self._registry.async_direct_request(
+                pairing_id, secret, operation, verify, enrollment=enrollment, on_active_status=on_active_status,
+            )
+            response = _response({"pairing_id": str(pairing_id), "server_id": str(self._registry.server_id),
+                                  "state": state.value, "profile": "signed-v1"})
+            if operation == "status" and state is PairingStatus.ACTIVE:
+                response.headers[_METADATA_CAPABILITY] = "1"
+                if metadata_result is not None:
+                    response.headers[_METADATA_RESULT] = metadata_result
+            return response
 
         return await self._run(request, handler)

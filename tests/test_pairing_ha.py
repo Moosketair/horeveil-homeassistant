@@ -575,6 +575,69 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response, {"error": "storage_outcome_unknown"})
         self.assertIsNone(unavailable["phone_labels"])
 
+    async def test_metadata_preserves_labels_and_revocation_orders_cleanup(self):
+        await self.start(universal=True)
+        await self.setup_calendars([])
+        self.enterContext(patch.object(pairing_ha_module, "_https_origins", return_value=[]))
+        phone = await self.signed_phone()
+        pairing_id = str(phone.id)
+        runtime = self.hass.data["horeveil.local_pairing_test"]
+        self.assertIn("result", await self.ws("rename", pairing_id=pairing_id, label="Chambre"))
+
+        async def status(version):
+            body = json.dumps({"calendar_revision": 0, "phone_metadata": {"app_version": version}}).encode()
+            headers = signed_headers(phone.key, _ORIGIN, "status", pairing_id, phone.server_id, phone.secret, body)
+            async with self.client.post(self.server.make_url(pairing_signed_module.DIRECT_BASE + "/status"),
+                                        data=body, headers=headers) as response:
+                return response.status, response.headers.get("Horeveil-Phone-Metadata-Result")
+
+        self.assertEqual(await status("2.7.4"), (200, "stored"))
+        info = (await self.ws("info"))["result"]
+        self.assertEqual(info["phone_labels"], {pairing_id: "Chambre"})
+        self.assertEqual(info["phone_metadata"], {pairing_id: {"app_version": "2.7.4"}})
+
+        entered, release, revoking = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        store = runtime.phone_metadata._store
+        save = store.async_save
+        revoke_phone = runtime.registry.async_revoke
+
+        async def delayed_update(data):
+            if data:
+                entered.set()
+                await release.wait()
+                await save(data)
+            # Simulate a failed cleanup after the tombstone is durable.
+
+        async def observe_revoke(*args, **kwargs):
+            revoking.set()
+            return await revoke_phone(*args, **kwargs)
+
+        with (patch.object(store, "async_save", delayed_update),
+              patch.object(runtime.registry, "async_revoke", observe_revoke),
+              self.assertLogs("custom_components.horeveil.phone_metadata", level="WARNING")):
+            update = asyncio.create_task(status("2.7.5"))
+            await asyncio.wait_for(entered.wait(), 5)
+            revoke = asyncio.create_task(self.ws("revoke", pairing_id=pairing_id, confirmed=True))
+            try:
+                await asyncio.wait_for(revoking.wait(), 5)
+                self.assertFalse(revoke.done())
+            finally:
+                release.set()
+                updated, revoked = await asyncio.gather(update, revoke)
+        self.assertEqual(updated, (200, "stored"))
+        self.assertEqual(revoked, {"result": {"state": "revoked"}})
+        self.assertEqual(await status("2.7.6"), (401, None))
+        invalid = (await self.ws("info"))["result"]
+        self.assertEqual(invalid["phones"], [])
+        self.assertEqual(invalid["phone_metadata"], {})
+        self.assertIn(pairing_id, await store.async_load())
+
+        restarted = self.new_ha()
+        restarted.is_stopping = False
+        await setup_domain(restarted, {})
+        metadata = restarted.data["horeveil.local_pairing_test"].phone_metadata
+        self.assertEqual(await metadata._store.async_load(), {})
+
     async def test_panel_publishes_only_a_server_validated_https_origin(self):
         for external, internal, expected in (
             ("https://outside.example:443/", "https://inside.example", "https://outside.example"),

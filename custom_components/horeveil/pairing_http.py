@@ -90,7 +90,9 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-async def _read_json(request: web.Request, fields: set[str]) -> tuple[dict, bytes]:
+async def _read_json(
+    request: web.Request, fields: set[str], *, alternative_fields: set[str] | None = None,
+) -> tuple[dict, bytes]:
     if request.content_type != "application/json" or "Content-Encoding" in request.headers:
         raise _InvalidRequest
     if request.content_length is not None and request.content_length > _MAX_BODY:
@@ -101,8 +103,13 @@ async def _read_json(request: web.Request, fields: set[str]) -> tuple[dict, byte
             if len(body) + len(chunk) > _MAX_BODY:
                 raise _BodyTooLarge
             body.extend(chunk)
-    payload = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object)
-    if not isinstance(payload, dict) or payload.keys() != fields:
+    def invalid_constant(_value: str) -> None:
+        raise _InvalidRequest
+
+    payload = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=invalid_constant)
+    if not isinstance(payload, dict) or (
+        payload.keys() != fields and (alternative_fields is None or payload.keys() != alternative_fields)
+    ):
         raise _InvalidRequest
     return payload, bytes(body)
 

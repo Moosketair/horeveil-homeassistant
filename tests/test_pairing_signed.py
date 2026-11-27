@@ -64,7 +64,8 @@ class SignedPairingTests(unittest.IsolatedAsyncioTestCase):
         stores = [DiskStore(self.hass, 1, name) for name in ("registry", "guard", "replay")]
         self.registry = pairing_module.PairingRegistry(*stores[:2], replay=stores[2], clock=lambda: self.monotonic)
         await self.registry.async_load()
-        self.http = SignedPairingHttp(self.registry)
+        self.metadata = pairing_signed_module.PhoneMetadataStore(self.hass)
+        self.http = SignedPairingHttp(self.registry, self.metadata)
         self.calendar_store = DiskStore(self.hass, 1, "calendar")
         self.receiver = receiver_module.SnapshotReceiver(self.hass, self.calendar_store, "test", "test")
         await self.receiver.async_restore()
@@ -104,10 +105,15 @@ class SignedPairingTests(unittest.IsolatedAsyncioTestCase):
         return body, signed_headers(key or self.key, origin, operation, reply["pairing_id"], reply["server_id"], self.secret, body, now=now)
 
     async def send(self, operation, prepared, expected):
+        payload, _headers = await self.send_response(operation, prepared, expected)
+        return payload
+
+    async def send_response(self, operation, prepared, expected):
         body, headers = prepared
         async with self.client.post(f"{DIRECT_BASE}/{operation}", data=body, headers=headers) as response:
-            self.assertEqual(response.status, expected, (operation, await response.json()))
-            return await response.json()
+            payload = await response.json()
+            self.assertEqual(response.status, expected, (operation, payload))
+            return payload, response.headers
 
     async def approve(self, invitation):
         review = await self.registry.async_review_claim(self.admin, invitation.invitation_id)
@@ -194,6 +200,102 @@ class SignedPairingTests(unittest.IsolatedAsyncioTestCase):
         await self.restart()
         await self.send("calendar", self.prepare("calendar", reply, payload), 401)
         self.assertEqual(self.receiver.direct_source, pairing_id)
+
+    async def test_calendar_metadata_updates_only_after_authorized_commit_or_exact_retry(self):
+        installation, reply = await self.activate_calendar_phone()
+        phone = UUID(reply["pairing_id"])
+        payload = self.calendar_payload(installation)
+        payload["occurrences"] = [{
+            "occurrence_id": "3a93297a-3f55-4ff3-8439-e3767f8b9b43/" + payload["window_start"][:10],
+            "alarm_id": "3a93297a-3f55-4ff3-8439-e3767f8b9b43",
+            "nominal_date": payload["window_start"][:10],
+            "sound_start": payload["window_start"],
+        }]
+        payload["alarms"] = {payload["occurrences"][0]["alarm_id"]: {"name": "Réveil"}}
+
+        async def publish(data, status=200):
+            return (await self.send("calendar", self.prepare("calendar", reply, data), status))["result"]
+
+        await self.registry.async_select_calendar_source(phone, self.receiver.async_select_source)
+        self.assertEqual(await publish(payload), "accepted")
+        self.assertEqual(await self.metadata.async_read([phone]), {})
+        expected_projection = tuple(self.receiver.current.iter_calendar_occurrences())
+        enriched = payload | {"revision": 2, "phone_metadata": {
+            "manufacturer": "é" * 32, "model": "<b>Modèle</b>", "app_version": "é" * 25,
+            "android_version": 17, "serial": "ignoré",
+        }}
+        self.metadata._store.fail = True
+        with self.assertLogs(self.metadata.__module__, level="WARNING"):
+            self.assertEqual(await publish(enriched), "accepted")
+        self.metadata._store.fail = False
+        self.assertEqual(await self.metadata.async_read([phone]), {})
+        self.assertEqual(await publish(dict(reversed(list(enriched.items())))), "duplicate")
+        self.assertEqual(await self.metadata.async_read([phone]), {})
+        self.assertEqual(await publish(enriched), "duplicate")
+        expected = {"manufacturer": "é" * 32, "model": "<b>Modèle</b>"}
+        self.assertEqual(await self.metadata.async_read([phone]), {str(phone): expected})
+        self.assertEqual(tuple(self.receiver.current.iter_calendar_occurrences()), expected_projection)
+        self.assertEqual(self.calendar_store.writes, 3)  # Source selection, then two accepted calendars.
+
+        newer = enriched | {"revision": 3, "phone_metadata": {
+            "app_version": " 2.7.5 ", "android_version": "17", "manufacturer": "unknown",
+            "model": "MAUVAIS\u0000", "ignored": "inutile",
+        }}
+        self.assertEqual(await publish(newer), "accepted")
+        expected |= {"app_version": "2.7.5", "android_version": "17"}
+        self.assertEqual(await publish(enriched, 409), "old_revision")
+        self.assertEqual(await publish(newer | {"phone_metadata": {"model": "Conflit"}}, 409), "revision_conflict")
+        self.assertEqual(await publish(newer | {"installation_id": str(uuid4()), "revision": 4}, 403),
+                         "different_installation")
+        self.assertEqual(await self.metadata.async_read([phone]), {str(phone): expected})
+        await self.restart()
+        self.assertEqual(await self.metadata.async_read([phone]), {str(phone): expected})
+        self.assertEqual(tuple(self.receiver.current.iter_calendar_occurrences()), expected_projection)
+
+    async def test_manual_metadata_is_active_only_and_orders_retried_calendars(self):
+        invitation, data, reply = await self.reserve()
+        phone = UUID(reply["pairing_id"])
+        extension = {"calendar_revision": 2, "phone_metadata": {"app_version": "2.7.5"}}
+        await self.send("enroll", self.prepare("enroll", reply, self.enroll_body(data, reply)), 200)
+        pending, headers = await self.send_response("status", self.prepare("status", reply, {}), 200)
+        self.assertNotEqual(pending["state"], "active")
+        self.assertNotIn("Horeveil-Phone-Metadata", headers)
+        await self.send("status", self.prepare("status", reply, extension), 401)
+        await self.approve(invitation)
+        await self.send("activate", self.prepare("activate", reply, {"confirmed": True}), 200)
+        historic, headers = await self.send_response("status", self.prepare("status", reply, {}), 200)
+        self.assertEqual(historic, {
+            "pairing_id": str(phone), "server_id": reply["server_id"], "state": "active", "profile": "signed-v1",
+        })
+        self.assertEqual(headers["Horeveil-Phone-Metadata"], "1")
+        self.assertNotIn("Horeveil-Phone-Metadata-Result", headers)
+
+        old = self.calendar_payload(data["installation_id"], revision=2)
+        old["phone_metadata"] = {"app_version": "2.7.4", "model": "Ancien"}
+        prepared_status = self.prepare("status", reply, extension)
+        await self.send("calendar", prepared_status, 401)
+        await self.send("status", self.prepare("status", reply, extension | {"occurrences": []}), 400)
+        await self.send("status", self.prepare("status", reply, extension | {"calendar_revision": True}), 400)
+        await self.send("status", self.prepare("status", reply, extension, key=ec.generate_private_key(ec.SECP256R1())), 401)
+        state, headers = await self.send_response("status", prepared_status, 200)
+        self.assertEqual(state, historic)
+        self.assertEqual(headers["Horeveil-Phone-Metadata-Result"], "stored")
+        self.assertIsNone(self.receiver.direct_source)
+        self.assertIsNone(self.receiver.current)
+        await self.send("status", prepared_status, 401)
+        await self.send("calendar", self.prepare("calendar", reply, old), 403)
+
+        await self.registry.async_select_calendar_source(phone, self.receiver.async_select_source)
+        await self.send("calendar", self.prepare("calendar", reply, old), 200)
+        self.assertEqual(await self.metadata.async_read([phone]), {str(phone): {"app_version": "2.7.5"}})
+        newer = old | {"revision": 3, "phone_metadata": {"app_version": "2.7.6"}}
+        await self.send("calendar", self.prepare("calendar", reply, newer), 200)
+        _, headers = await self.send_response("status", self.prepare("status", reply, extension), 200)
+        self.assertEqual(headers["Horeveil-Phone-Metadata-Result"], "ignored")
+        self.assertEqual(await self.metadata.async_read([phone]), {str(phone): {"app_version": "2.7.6"}})
+        self.assertTrue(await self.registry.async_revoke(phone))
+        await self.send("status", self.prepare("status", reply, extension | {"calendar_revision": 4}), 401)
+        self.assertEqual(await self.metadata.async_read(await self.registry.async_list_active()), {})
 
     async def test_end_to_end_requires_same_key_and_replay_survives_restart(self):
         invitation, data, reply = await self.reserve()

@@ -284,7 +284,8 @@ with patch.dict(
 
 
 CONTRACT = Path(__file__).resolve().parents[1] / "docs" / "CALENDAR_SNAPSHOT_SCHEMA_V1.md"
-EXAMPLE = json.loads(CONTRACT.read_text("utf-8").split("```json\n", 1)[1].split("```", 1)[0])
+EXAMPLE_SECTION = CONTRACT.read_text("utf-8").split("\n## Exemple\n", 1)[1]
+EXAMPLE = json.loads(EXAMPLE_SECTION.split("```json\n", 1)[1].split("```", 1)[0])
 
 
 class CalendarStoreReadTests(unittest.IsolatedAsyncioTestCase):

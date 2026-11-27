@@ -24,7 +24,52 @@ pour traiter à la fois les anciens et les nouveaux instantanés.
 | `timezone` | chaîne | Identifiant `ZoneId` Java de la projection, commun à toutes les lignes. |
 | `expires_at` | chaîne ISO 8601 UTC | Premier instant où l’état est périmé. Strictement après `generated_at` et au plus tard à `window_end_exclusive`. |
 | `alarms` | objet facultatif | Catalogue de la destination, indexé par UUID d’alarme. Les nouveaux envois le fournissent, avec `{}` si aucune alarme n’est autorisée. |
+| `phone_metadata` | objet facultatif | Informations de présentation du téléphone pour la destination Home Assistant directe et signée. |
 | `occurrences` | tableau | Liste complète des occurrences, éventuellement vide. |
+
+## Métadonnées du téléphone
+
+`phone_metadata` est une extension additive de la v1. Android la joint
+uniquement aux publications HTTPS directes pour Home Assistant, avant
+chiffrement de la file d’attente et avant signature du corps. Le webhook
+local n’exploite pas ce champ. Voici un extrait d’instantané.
+
+```json
+{
+  "phone_metadata": {
+    "manufacturer": "Samsung",
+    "model": "SM-S936B",
+    "app_version": "2.7.4",
+    "android_version": "17"
+  }
+}
+```
+
+| Champ facultatif | Origine Android | Taille maximale |
+| --- | --- | --- |
+| `manufacturer` | `Build.MANUFACTURER` | 64 octets UTF-8 |
+| `model` | `Build.MODEL`, nom ou code fourni par le constructeur | 128 octets UTF-8 |
+| `app_version` | `BuildConfig.VERSION_NAME` | 48 octets UTF-8 |
+| `android_version` | `Build.VERSION.RELEASE` | 32 octets UTF-8 |
+
+Chaque valeur doit être une chaîne imprimable, espace ordinaire compris.
+La limite porte sur la valeur avant retrait des espaces aux extrémités.
+Une chaîne vide après retrait des espaces, `unknown` quelle que soit sa
+casse, un caractère non imprimable, un type incompatible ou une taille
+excessive invalide le champ concerné. Les clés inconnues et un
+`phone_metadata` qui n’est pas un objet sont ignorés. Une valeur absente ou
+ignorée conserve la dernière valeur connue. Les règles existantes de
+validité du JSON restent applicables, notamment le refus des clés dupliquées.
+Android transmet seulement les quatre valeurs prévues, sans identifiant
+matériel sensible ni recherche externe.
+
+Si cet objet fait dépasser la limite du corps, Android peut l’omettre lors
+de la préparation de cette révision. Une fois la révision en file, son corps
+reste identique lors des reprises. La comparaison de révision continue de
+porter sur le JSON complet. La projection des alarmes, les occurrences et
+leur empreinte métier restent indépendantes de ces champs. La
+[réception signée et l’ordre des mises à jour](SYNCHRONISATION_DIRECTE_3C4C4.md#étape-3c4c7b--métadonnées-des-téléphones-et-panneau)
+s’appliquent aussi à la vérification manuelle de l’association.
 
 ## Catalogue des alarmes
 
@@ -54,7 +99,7 @@ Le JSON UTF-8 entier est limité à **1 048 576 octets**. Au-delà, `encode()`
 signale `CalendarSnapshotTooLarge` et ne retourne aucun corps partiel. Le
 sérialiseur rejette aussi les doublons et les incohérences de borne, de fuseau ou
 d’identité, ainsi qu’une référence manquante dans un catalogue fourni. Le
-catalogue et les occurrences comptent ensemble dans la limite.
+catalogue, les occurrences et les extensions comptent ensemble dans la limite.
 
 ## Exemple
 

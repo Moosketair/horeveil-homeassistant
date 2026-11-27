@@ -31,6 +31,7 @@ from .const import CALENDAR_RECEIVERS, DOMAIN, PAIRING_RUNTIME as _RUNTIME_KEY
 from .pairing import InvalidPairingCredential, PairingError, PairingRegistry, _persist, validate_origin
 from .pairing_http import PairingHttp
 from .pairing_native import NativePairingIngress
+from .phone_metadata import PhoneMetadataStore
 from .receiver import async_load_calendar_store, calendar_store
 from .pairing_proxy import PAIRING_BASE, FINGERPRINT, PairingProxy, build_proxy_tls, direct_tls, pinned_certificate
 
@@ -100,6 +101,7 @@ class _PairingRuntime:
         self.labels: Store[dict[str, str]] = Store(
             hass, 1, f"{DOMAIN}.pairing_labels", private=True, atomic_writes=True,
         )
+        self.phone_metadata = PhoneMetadataStore(hass)
         # Label operations take this lock before consulting or revoking in the registry.
         self.labels_lock = Lock()
 
@@ -430,6 +432,7 @@ async def _info(hass, connection, msg) -> None:
             labels = await operation.test.async_load_labels() if active else {}
         except (HomeAssistantError, OSError, ValueError):
             labels = None
+        metadata = await operation.test.phone_metadata.async_read(signed) if signed else {}
     phones = [str(pairing_id) for pairing_id in active]
     result = {
         "suggested_origin": suggestion or operation.test.origin,
@@ -445,6 +448,7 @@ async def _info(hass, connection, msg) -> None:
     if (native := operation.test.native) is not None:
         result["configured_origin"] = native.configured_origin
     if operation.test.universal:
+        result["phone_metadata"] = metadata
         result["https_origins"] = origins = _https_origins(hass)
         result["suggested_origin"] = origins[0] if origins else None
         result["calendar_phones"] = [str(pairing_id) for pairing_id in signed]
@@ -557,10 +561,13 @@ async def _revoke(hass, connection, msg) -> None:
             operation.error("confirmation_required")
             return
         async def purge(pairing_id):
-            receivers = tuple(hass.data.get(CALENDAR_RECEIVERS, {}).values())
-            cleaned = [await receiver.async_select_source(None, forget=pairing_id) for receiver in receivers]
-            if not all(cleaned):
-                raise PairingError("Calendar storage unavailable")
+            try:
+                receivers = tuple(hass.data.get(CALENDAR_RECEIVERS, {}).values())
+                cleaned = [await receiver.async_select_source(None, forget=pairing_id) for receiver in receivers]
+                if not all(cleaned):
+                    raise PairingError("Calendar storage unavailable")
+            finally:
+                await operation.test.phone_metadata.async_remove((pairing_id,))
 
         pairing_id = _uuid(msg.get("pairing_id"))
 
@@ -665,7 +672,7 @@ async def async_setup_local_pairing(
         from .pairing_signed import DIRECT_BASE, SignedPairingHttp
 
         test.universal = True
-        test.http = SignedPairingHttp(registry)
+        test.http = SignedPairingHttp(registry, test.phone_metadata)
 
         class DirectView(_PairView):
             def __init__(self, operation):
@@ -704,6 +711,11 @@ async def async_setup_local_pairing(
         websocket_api.async_register_command(hass, _direct_access)
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, test.stop)
     hass.data[_RUNTIME_KEY] = test
+    if universal:
+        try:
+            await registry.async_clean_revoked(test.phone_metadata.async_remove)
+        except PairingError:
+            _LOGGER.warning("Horéveil could not verify revoked phones for cleanup")
     async with test.labels_lock:
         await test.async_prune_labels()
     if "frontend" in hass.config.components:

@@ -351,3 +351,116 @@ Sous Windows, 47 tests Python d’association et 31 tests de réception ou
 de lecture ont réussi avec Python 3.13. Les sept scénarios Chrome avec
 Playwright et le contrôle de syntaxe JavaScript ont réussi. Les sondes
 Core ont utilisé Python 3.14. Le lot est remis pour contre-vérification ciblée.
+
+## Étape 3C4C.7.B — Métadonnées des téléphones et panneau
+
+La base `46ab5b2` correspond à la préversion publiée `0.4.0-beta.2`.
+L’utilisateur a validé les sept essais réels de 3C4C.6. Le lot 3C4C.7.B
+est livré localement sur `feature/3c4c7-phone-metadata`. Android est traité
+dans une étape suivante.
+
+Le [schéma v1](CALENDAR_SNAPSHOT_SCHEMA_V1.md#métadonnées-du-téléphone)
+définit les quatre champs facultatifs. Un calendrier signé autorisé alimente
+la fiche après acceptation et écriture du calendrier. Une répétition
+autorisée avec le même corps JSON octet pour octet peut compléter une
+écriture de fiche manquée, avec l’accusé `duplicate` habituel. Un doublon
+équivalent dont la sérialisation diffère garde le même accusé. Une révision
+refusée, conflictuelle ou obsolète ne met pas la fiche à jour.
+
+Les métadonnées et leur dernière révision sont dans le Store privé
+`horeveil.phone_metadata`, indexées par `pairing_id`. Le registre,
+les libellés et les projections utilisent leurs Stores existants. Le
+verrou du registre ordonne les deux voies d’écriture de la fiche avec
+la révocation. La tombstone est persistée avant le nettoyage de la fiche.
+Le panneau ne publie que les informations des associations signées actives.
+Si le nettoyage échoue, il est retenté au redémarrage. Un Store de
+métadonnées indisponible laisse le calendrier valide conserver son accusé
+habituel. Les erreurs sont journalisées sans valeurs de la fiche.
+
+### Vérifier l’association sans calendrier
+
+1. Pendant l’action manuelle Android **Vérifier l’association**, effectuer
+   le `POST /api/horeveil/direct/v1/status` signé habituel avec `{}`.
+   Le corps de la réponse historique reste identique. Un serveur compatible
+   ajoute l’en-tête `Horeveil-Phone-Metadata: 1` sur une réponse `200`
+   pour une association active.
+2. Après avoir vérifié la réponse, l’identité et le serveur de l’association,
+   et uniquement si cet en-tête vaut `1`, Android peut envoyer au même
+   endpoint un second POST signé, avec un nonce inédit. Il conserve la
+   méthode, l’origine, le tag `horeveil-status-v1`, les composants de
+   signature et le profil historiques. Les deux seules clés autorisées
+   à la racine de ce nouveau corps sont `calendar_revision` et
+   `phone_metadata`. La limite existante du corps du status reste de 4 Kio.
+
+   ```json
+   {
+     "calendar_revision": 42,
+     "phone_metadata": {
+       "manufacturer": "Samsung",
+       "model": "SM-S936B",
+       "app_version": "2.7.4",
+       "android_version": "17"
+     }
+   }
+   ```
+
+3. La réponse `200` conserve le corps standard du status actif.
+   `Horeveil-Phone-Metadata-Result` indique `stored` si les valeurs valides
+   sont persistées ou déjà présentes pour cette révision, `ignored` si
+   la révision est trop ancienne ou qu’aucun champ n’est exploitable, et
+   `unavailable` si le Store ne confirme pas l’opération.
+   Une révision invalide ou des clés racine inattendues valent `400`.
+   Une association absente, en attente ou révoquée ne peut effectuer
+   cette écriture. Les vérifications de signature et de nonce habituelles
+   s’appliquent. Cette opération n’accède ni aux récepteurs ni aux
+   fonctions d’affectation de source.
+
+`calendar_revision` est un entier JSON de 0 à 2⁶³−1 inclus. Android doit
+lire **la plus haute révision déjà allouée** pour la destination calendrier
+associée à ce `pairing_id`, y compris une révision chiffrée encore en
+attente de livraison. Il envoie 0 uniquement si aucune révision n’a été
+allouée pour cette association. L’implémentation Android pourra lire
+`calendarRevision` dans la destination Home Assistant du `WebhookStore`.
+La vérification manuelle conserve la sérialisation des actions de
+l’association. Elle ne met pas le status enrichi en file et ne crée
+aucune tâche périodique.
+
+Home Assistant compare cette valeur à la dernière révision qui a alimenté
+la fiche. Un calendrier doit avoir une révision supérieure. Une vérification
+manuelle peut enrichir la fiche à révision égale. Si plusieurs vérifications
+manuelles utilisent la même révision, la dernière traitée l’emporte pour
+les seuls champs valides qu’elle contient. Sans champ valide, le seuil
+n’avance pas. Ainsi un instantané déjà alloué au moment d’une vérification
+manuelle réussie peut encore alimenter le calendrier si ses règles métier
+l’autorisent, sans restaurer ses anciennes métadonnées. Les deux voies
+suivent la même révision par association, indépendamment de l’horloge.
+
+L’Android 2.7.4 continue d’envoyer des calendriers et des status historiques.
+Un Android enrichi ne tente le second POST que si le serveur annonce la
+capacité. La bêta 2 accepte déjà les instantanés v1 enrichis, en conserve le
+JSON et ignore cette extension pour la projection. Le panneau présente le
+libellé, les champs disponibles et la dernière réception du calendrier dans
+le fuseau configuré de Home Assistant. La date renseigne sur la réception
+du calendrier, indépendamment de l’état d’association.
+
+### Vérifications du 27 novembre 2026
+
+- `python -m unittest discover -s tests -p "test_*.py"` sous Python 3.13.
+  Les 81 tests réussissent. Les scénarios signés testent les deux voies,
+  les reprises, la compatibilité du status historique, la séparation de
+  la projection et la révocation. Le scénario HTTPS et WebSocket couvre
+  le libellé, une écriture concurrente à la révocation, un nettoyage
+  défaillant et sa reprise après reconstruction du runtime.
+- `python tests/panel_mutation_browser.py --channel chrome`. Les 9
+  scénarios réussissent, dont le contraste sous accent blanc, le focus
+  clavier, l’actualisation et ses erreurs, ainsi que le fuseau de
+  l’instance quand le navigateur utilise un autre fuseau. L’option
+  `--screenshots` génère deux captures sur données de test.
+- `node --check custom_components/horeveil/pairing_panel.js` et
+  `git diff --check` réussissent.
+
+Les résultats couvrent des doubles Home Assistant, du trafic de test signé
+et un navigateur local. La recette Core réel et Android du lot reste à
+faire. La contre-relecture indépendante ciblée porte sur la possibilité
+d’écrire exclusivement sa propre fiche après authentification, l’ordre
+avec la révocation et l’absence de droits supplémentaires.

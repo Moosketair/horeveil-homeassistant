@@ -62,6 +62,10 @@ class Snapshot:
         """Compare the entire JSON, including extensions."""
         return self.raw == other.raw or _equal_json(self._content, other._content)
 
+    @property
+    def phone_metadata(self) -> object:
+        return self._content.get("phone_metadata")
+
     def iter_calendar_occurrences(self) -> Iterator[CalendarOccurrence]:
         """Read already validated occurrences without changing the payload."""
         catalog = self._content.get("alarms", {})

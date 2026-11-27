@@ -23,6 +23,8 @@ const template = `
       border-radius: var(--ha-card-border-radius, 12px); }
     .heading, .actions, .check { display: flex; align-items: center; gap: 8px; }
     .heading ha-icon { color: var(--primary-color); --mdc-icon-size: 22px; }
+    #refresh { margin-inline-start: auto; min-width: 42px; padding: 0; border-color: transparent; }
+    #refresh ha-icon { color: inherit; }
     .actions { flex-wrap: wrap; }
     .stack { display: grid; gap: 12px; }
     .field { display: grid; gap: 6px; font-weight: 500; }
@@ -37,8 +39,11 @@ const template = `
       color: var(--primary-text-color); background: transparent; border: 1px solid var(--divider-color);
       border-radius: var(--ha-border-radius-lg, 12px); cursor: pointer; text-align: center; }
     button:hover, .button:hover { background: var(--secondary-background-color); }
-    .primary, .primary:hover { background: var(--primary-color);
-      color: var(--primary-color-text, var(--text-primary-color)); border-color: transparent; }
+    .primary:not(:disabled) {
+      background: var(--ha-color-fill-primary-normal-resting, var(--primary-text-color));
+      color: var(--ha-color-on-primary-normal, var(--card-background-color)); border-color: transparent; }
+    .primary:not(:disabled):hover {
+      background: var(--ha-color-fill-primary-normal-hover, var(--ha-color-fill-primary-normal-resting, var(--primary-text-color))); }
     .danger { color: var(--error-color); }
     button:disabled { color: var(--disabled-text-color); background: var(--secondary-background-color); cursor: default; }
     .muted { color: var(--secondary-text-color); }
@@ -85,10 +90,14 @@ const template = `
     <button id="retry" type="button" hidden>Réessayer</button>
     <div id="content" hidden>
       <section id="phones-card" aria-labelledby="phones-title">
-        <div class="heading"><ha-icon icon="mdi:cellphone" aria-hidden="true"></ha-icon><h2 id="phones-title">Téléphones associés</h2></div>
+        <div class="heading">
+          <ha-icon icon="mdi:cellphone" aria-hidden="true"></ha-icon><h2 id="phones-title">Téléphones associés</h2>
+          <button id="refresh" type="button" aria-label="Actualiser la liste des téléphones" title="Actualiser la liste des téléphones">
+            <ha-icon icon="mdi:refresh" aria-hidden="true"></ha-icon>
+          </button>
+        </div>
         <p id="empty">Aucun téléphone associé.</p>
         <ul id="phones" hidden></ul>
-        <div><button id="refresh" type="button">Actualiser la liste</button></div>
       </section>
       <section aria-labelledby="add-title">
         <div class="heading"><ha-icon icon="mdi:qrcode-scan" aria-hidden="true"></ha-icon><h2 id="add-title">Associer un téléphone</h2></div>
@@ -169,6 +178,35 @@ function actionButton(title, action, className = "") {
   button.textContent = title;
   button.onclick = action;
   return button;
+}
+
+function phoneDescription(metadata = {}) {
+  const { manufacturer, model, app_version, android_version } = metadata;
+  const make = manufacturer?.toLocaleLowerCase("fr");
+  const modelName = model?.toLocaleLowerCase("fr");
+  const includesMake = make && (modelName === make || modelName?.startsWith(make + " "));
+  const device = [includesMake ? null : manufacturer, model].filter(Boolean).join(" ");
+  const versions = [app_version && `Horéveil ${app_version}`, android_version && `Android ${android_version}`];
+  return ["Associé", device || "Modèle indisponible", ...versions.filter(Boolean)].join(" · ");
+}
+
+function receiptFormatter(timeZone) {
+  try {
+    return new Intl.DateTimeFormat("fr-FR", {
+      timeZone, hourCycle: "h23", day: "2-digit", month: "2-digit", year: "numeric",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+  } catch (error) {
+    if (error instanceof RangeError) return null;
+    throw error;
+  }
+}
+
+function formatReceipt(value, formatter) {
+  const date = new Date(value);
+  if (!formatter || value == null || !Number.isFinite(date.getTime())) return null;
+  const parts = Object.fromEntries(formatter.formatToParts(date).map(({ type, value }) => [type, value]));
+  return `${parts.day}/${parts.month}/${parts.year} à ${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
 function drawInvitationQr(canvas, origin, code, expiresAt) {
@@ -504,6 +542,7 @@ class HoreveilAssociation extends HTMLElement {
     this.#configuredOrigin = info.configured_origin;
     this.#element("content").hidden = false;
     const calendars = info.calendars ?? [];
+    const formatter = receiptFormatter(this.#hass.config?.time_zone ?? "UTC");
     const eligible = new Set(info.calendar_phones ?? []);
     const labelsAvailable = info.phone_labels !== null;
     const name = (id) => info.phone_labels?.[id]
@@ -517,12 +556,13 @@ class HoreveilAssociation extends HTMLElement {
       title.textContent = name(id);
       const details = document.createElement("p");
       details.className = "muted";
-      details.textContent = "Associé · Modèle indisponible";
+      details.textContent = phoneDescription(info.phone_metadata?.[id]);
       const sync = document.createElement("p");
       const receipts = calendars.filter((entry) => entry.pairing_id === id && entry.last_success);
-      const last = Math.max(...receipts.map((entry) => Date.parse(entry.last_success)));
-      sync.textContent = Number.isFinite(last)
-        ? `Dernière réception du calendrier le ${new Date(last).toLocaleString()}`
+      const mostRecent = Math.max(...receipts.map((entry) => Date.parse(entry.last_success)).filter(Number.isFinite));
+      const last = formatReceipt(mostRecent, formatter);
+      sync.textContent = last
+        ? `Dernière réception du calendrier le ${last}`
         : "Aucune réception du calendrier disponible pour ce téléphone.";
       const actions = document.createElement("div");
       actions.className = "actions";
@@ -592,8 +632,9 @@ class HoreveilAssociation extends HTMLElement {
       select.onchange = () => { save.disabled = select.value === selected; };
       const last = document.createElement("p");
       last.className = "muted";
-      last.textContent = entry.last_success
-        ? `Dernière réception réussie le ${new Date(entry.last_success).toLocaleString()}`
+      const receipt = formatReceipt(entry.last_success, formatter);
+      last.textContent = receipt
+        ? `Dernière réception réussie le ${receipt}`
         : "Aucune réception pour cette source.";
       const actions = document.createElement("div");
       actions.append(save);
