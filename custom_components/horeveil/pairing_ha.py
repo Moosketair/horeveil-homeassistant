@@ -31,6 +31,7 @@ from .const import CALENDAR_RECEIVERS, DOMAIN, PAIRING_RUNTIME as _RUNTIME_KEY
 from .pairing import InvalidPairingCredential, PairingError, PairingRegistry, _persist, validate_origin
 from .pairing_http import PairingHttp
 from .pairing_native import NativePairingIngress
+from .receiver import calendar_store
 from .pairing_proxy import PAIRING_BASE, FINGERPRINT, PairingProxy, build_proxy_tls, direct_tls, pinned_certificate
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,6 +47,32 @@ _PUBLIC_KEY = re.compile(r"[A-Za-z0-9_-]{392}", re.ASCII)
 
 class _StorageOutcomeUnknown(PairingError):
     """The operation reached the Store and its durable result could not be verified."""
+
+
+async def _calendar_owners(hass: HomeAssistant) -> dict[UUID, set[str]] | None:
+    """Resolve claims from live receivers and the Stores of configured, unloaded entries."""
+    receivers = hass.data.get(CALENDAR_RECEIVERS, {}).copy()
+    owners: dict[UUID, set[str]] = {}
+    for entry_id, receiver in receivers.items():
+        for source in receiver.possible_direct_sources:
+            owners.setdefault(source, set()).add(entry_id)
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.entry_id in receivers:
+            continue
+        try:
+            stored = await calendar_store(hass, entry.entry_id).async_load()
+            if stored is None:
+                continue
+            if not isinstance(stored, dict):
+                return None
+            source = stored.get("direct_source")
+            if source is not None:
+                if not isinstance(source, str):
+                    return None
+                owners.setdefault(UUID(source), set()).add(entry.entry_id)
+        except (HomeAssistantError, OSError, ValueError):
+            return None
+    return owners
 
 
 def _supports_local_test(server) -> bool:
@@ -428,6 +455,7 @@ async def _info(hass, connection, msg) -> None:
         result["https_origins"] = origins = _https_origins(hass)
         result["suggested_origin"] = origins[0] if origins else None
         result["calendar_phones"] = [str(pairing_id) for pairing_id in signed]
+        owners = await _calendar_owners(hass)
         calendars = result["calendars"] = []
         receivers = hass.data.get(CALENDAR_RECEIVERS, {})
         for entry in hass.config_entries.async_entries(DOMAIN):
@@ -440,6 +468,11 @@ async def _info(hass, connection, msg) -> None:
                 "entry_id": entry.entry_id,
                 "title": entry.title,
                 "source_uncertain": uncertain,
+                "source_conflict": owners is not None and source is not None and len(owners.get(source, ())) > 1,
+                "ownership_unavailable": owners is None,
+                "unavailable_phones": [
+                    str(phone) for phone in signed if owners is None or owners.get(phone, set()) - {entry.entry_id}
+                ],
                 "pairing_id": str(source) if source else None,
                 "last_success": received_at.isoformat() if received_at else None,
             })
@@ -501,11 +534,11 @@ async def _calendar_source(hass, connection, msg) -> None:
         pairing_id = _uuid(msg["pairing_id"]) if msg["pairing_id"] is not None else None
 
         async def select(source):
-            if source is not None and any(
-                candidate is not receiver and candidate.direct_source == source
-                for candidate in receivers.values()
-            ):
-                return False
+            # The registry serializes this lookup and the write with direct publication.
+            if source is not None:
+                owners = await _calendar_owners(hass)
+                if owners is None or owners.get(source, set()) - {msg["entry_id"]}:
+                    return False
             selected = await receiver.async_select_source(source)
             if not selected and receiver.source_selection_uncertain:
                 raise _StorageOutcomeUnknown("Unable to verify persisted calendar source")
@@ -652,10 +685,15 @@ async def async_setup_local_pairing(
                 if self.operation == "claim":
                     return await test.http.claim(request)
                 if self.operation == "calendar":
-                    def find_receiver(pairing_id):
-                        found = [receiver for receiver in hass.data.get(CALENDAR_RECEIVERS, {}).values()
-                                 if receiver.direct_source == pairing_id]
-                        return found[0] if len(found) == 1 else None
+                    async def find_receiver(pairing_id):
+                        owners = await _calendar_owners(hass)
+                        entries = owners.get(pairing_id, ()) if owners is not None else ()
+                        if len(entries) != 1:
+                            return None
+                        receiver = hass.data.get(CALENDAR_RECEIVERS, {}).get(next(iter(entries)))
+                        if receiver and not receiver.source_selection_uncertain and receiver.direct_source == pairing_id:
+                            return receiver
+                        return None
 
                     return await test.http.calendar(request, hass, find_receiver)
                 return await test.http.signed(request, self.operation)

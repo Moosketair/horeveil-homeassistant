@@ -101,7 +101,7 @@ class SignedPairingHttp(PairingHttp):
                 return _verify(request, body, "calendar", pairing_id, key, origin, server_id)
 
             async def publish(association):
-                receiver = find_receiver(pairing_id)
+                receiver = await find_receiver(pairing_id)
                 if receiver is None:
                     return _reply(HTTPStatus.FORBIDDEN, "source_not_authorized")
                 return await receiver.async_handle_direct(body, pairing_id, association.installation_id)

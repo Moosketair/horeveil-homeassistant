@@ -226,3 +226,63 @@ récepteur ont réussi avec Python 3.13. Les six scénarios Playwright et le
 contrôle de syntaxe JavaScript ont réussi. La recette Core réelle de 3C4C.6.1
 reste la référence pour les parcours ordinaires. Le lot est remis pour
 contre-vérification des deux sondes ciblées.
+
+## Étape 3C4C.6.3 — Unicité de la source signée
+
+Sur `a48f2d4`, l’écriture de l’affectation à A réussissait puis sa relecture
+échouait. Le sélecteur consultait la source précédente en mémoire. B
+acceptait le même téléphone. Après rechargement de A, l’envoi signé recevait
+`403 source_not_authorized`.
+
+La sélection et le routage utilisent désormais le même décompte des
+affectations, sous la coordination existante du registre. Un récepteur
+chargé expose sa source confirmée ou les deux sources possibles si l’écriture
+reste indéterminée. Pour une entrée configurée et déchargée, la décision
+repose sur le Store. Un envoi signé exige une seule entrée revendiquant le
+téléphone, chargée et dont l’affectation est confirmée.
+
+| Transition indéterminée | Téléphones réservés pendant l’incertitude |
+| --- | --- |
+| Webhook → téléphone | Nouveau téléphone |
+| Téléphone → webhook | Ancien téléphone |
+| Téléphone → autre téléphone | Ancien et nouveau téléphones |
+
+Un refus avant tentative d’écriture ne crée aucune réservation. Après
+rechargement ou redémarrage, la lecture du Store retient uniquement la
+source effectivement persistée et libère l’autre possibilité. Le chargement
+d’une entrée dont le téléphone a été révoqué garde le refus et le nettoyage
+de la projection prévus.
+Le changement de source efface uniquement la projection de l’entrée ciblée.
+L’actualisation du panneau est une lecture.
+
+Un conflit déjà présent, même si une des entrées est déchargée, bloque
+l’envoi signé. Le panneau explique le conflit et permet de changer
+explicitement la source d’une des entrées. Les projections restent lisibles
+jusqu’à cette décision. Si le Store d’une entrée déchargée est illisible,
+l’unicité des affectations signées ne peut pas être établie. Les écritures et
+les nouvelles affectations signées sont suspendues jusqu’à une lecture
+exploitable. Les webhooks indépendants restent disponibles. Avec une
+incertitude bornée aux sources d’un récepteur chargé, les autres téléphones
+restent utilisables.
+
+### Vérification ciblée
+
+- La sonde historique passe avec le correctif. La matrice sur Stores disque
+  couvre les trois transitions avec ancienne ou nouvelle valeur persistée,
+  le refus préalable, l’écriture qui lève une erreur, la relecture qui
+  échoue, le rechargement, la reconstruction du runtime, la concurrence,
+  le conflit déjà présent et la révocation. Elle vérifie aussi le webhook
+  et la livraison signée indépendants et compare les fichiers avant et
+  après lecture.
+- `python tests/qualify_native_transport.py --signed --assignment-reload`
+  a réussi en HTTPS sur Core 2026.11.2 isolé, sous Windows avec Python
+  3.14. Le serveur refuse l’affectation à B avant et pendant le déchargement
+  de A. Le rechargement Core restaure A, dont l’envoi signé est accepté. Le
+  webhook historique et le refus après révocation ont également été vérifiés.
+- Le scénario Playwright supplémentaire vérifie le message de conflit,
+  l’indisponibilité des téléphones réservés et l’accès au webhook pour
+  résoudre le conflit.
+
+Résultats sous Windows : 46 tests Python d’association et 30 tests de
+récepteur réussis avec Python 3.13. Sept scénarios Chrome avec Playwright
+1.65.2 et le contrôle de syntaxe JavaScript ont réussi.

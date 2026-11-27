@@ -551,12 +551,18 @@ class HoreveilAssociation extends HTMLElement {
       const select = document.createElement("select");
       const selected = entry.pairing_id ?? "";
       const choices = new Map([["", "Webhook local"]]);
+      const unavailable = new Set(entry.unavailable_phones ?? []);
       for (const id of eligible) {
-        if (id !== selected && calendars.some((other) => other !== entry && other.pairing_id === id)) continue;
+        if (id !== selected && unavailable.has(id)) continue;
         choices.set(id, `${name(id)} · HTTPS direct`);
       }
       if (!choices.has(selected)) choices.set(selected, "Téléphone indisponible · écritures bloquées");
-      current.textContent = `Source active · ${choices.get(selected)}`;
+      const blocked = entry.source_conflict || (entry.ownership_unavailable && selected);
+      current.textContent = `${blocked ? "Source configurée" : "Source active"} · ${choices.get(selected)}`;
+      const warning = document.createElement("p");
+      warning.textContent = entry.source_conflict
+        ? "Ce téléphone est affecté à plusieurs calendriers. Les envois signés sont bloqués. Changez explicitement la source d’une des entrées."
+        : "Une entrée indisponible empêche de vérifier les affectations. Rechargez-la pour rétablir les envois signés.";
       for (const [value, title] of choices) {
         const option = document.createElement("option");
         option.value = value;
@@ -591,7 +597,9 @@ class HoreveilAssociation extends HTMLElement {
         : "Aucune réception pour cette source.";
       const actions = document.createElement("div");
       actions.append(save);
-      row.append(title, current, last, label, actions);
+      row.append(title, current);
+      if (entry.source_conflict || entry.ownership_unavailable) row.append(warning);
+      row.append(last, label, actions);
       return row;
     }));
     this.#stale = false;

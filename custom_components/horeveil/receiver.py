@@ -25,6 +25,13 @@ class SnapshotRequestError(ValueError):
         self.result = result
 
 
+def calendar_store(hass: HomeAssistant, entry_id: str) -> Store:
+    return Store(
+        hass, 1, f"{DOMAIN}.{entry_id}", private=True,
+        atomic_writes=True, serialize_in_event_loop=False,
+    )
+
+
 async def async_read_snapshot_body(request: web.Request) -> bytes:
     media_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip()
     encoding = request.headers.get("Content-Encoding", "identity").lower()
@@ -54,9 +61,20 @@ class SnapshotReceiver:
         self.received_at: datetime | None = None
         self._closed = False
         self._storage_uncertain = False
-        self.source_selection_uncertain = False
+        self._unverified_source: frozenset[UUID] | None = None
         self.direct_source: UUID | None = None
         self._direct_watermarks: dict[str, int] = {}
+
+    @property
+    def source_selection_uncertain(self) -> bool:
+        return self._unverified_source is not None
+
+    @property
+    def possible_direct_sources(self) -> frozenset[UUID]:
+        """Keep both ownership possibilities until a fresh receiver restores the Store."""
+        if self._unverified_source is not None:
+            return self._unverified_source
+        return frozenset() if self.direct_source is None else frozenset((self.direct_source,))
 
     @property
     def freshness(self) -> str:
@@ -99,7 +117,7 @@ class SnapshotReceiver:
     async def async_select_source(self, pairing_id: UUID | None, *, forget: UUID | None = None) -> bool:
         """Persist ownership and remove the previous projection in the same write."""
         async with self._lock:
-            if (forget is not None and forget != self.direct_source
+            if (forget is not None and forget not in self.possible_direct_sources
                     and str(forget) not in self._direct_watermarks):
                 return True
             if self._closed or self._storage_uncertain or self._hass.is_stopping:
@@ -128,7 +146,9 @@ class SnapshotReceiver:
             except Exception:
                 self._storage_uncertain = True
                 if forget is None:
-                    self.source_selection_uncertain = True
+                    self._unverified_source = frozenset(
+                        source for source in (self.direct_source, pairing_id) if source is not None
+                    )
                 if forget is not None and forget == self.direct_source:
                     self._hide_snapshot()
                 return False

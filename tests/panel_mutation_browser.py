@@ -28,6 +28,18 @@ FIXTURE = """
         failRead = false;
         throw Error("Connection lost");
       }
+      if (window.mode === "ownership") {
+        return {
+          phones: ["phone", "reserved"], calendar_phones: ["phone", "reserved"],
+          phone_labels: { phone: label, reserved: "Téléphone réservé" },
+          calendars: [{
+            title: "Calendrier", entry_id: "calendar", pairing_id: "phone",
+            source_conflict: !window.ownershipUnavailable,
+            ownership_unavailable: Boolean(window.ownershipUnavailable),
+            unavailable_phones: ["phone", "reserved"],
+          }],
+        };
+      }
       return {
         phones: [...phones], calendar_phones: [...phones],
         phone_labels: uncertain === "rename" ? null : { phone: label },
@@ -80,7 +92,7 @@ def main(channel):
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(channel=channel)
         try:
-            for mode in ("success", "acknowledged", "rejected", "lost", "disconnected", "storage"):
+            for mode in ("success", "acknowledged", "rejected", "lost", "disconnected", "storage", "ownership"):
                 page = browser.new_page()
                 page.route(ORIGIN + "/", lambda route: route.fulfill(body=FIXTURE, content_type="text/html"))
                 for name, file in (("pairing-panel.js", "pairing_panel.js"), ("pairing-qrcode.js", "pairing_qrcode.js")):
@@ -90,6 +102,20 @@ def main(channel):
                 page.goto(ORIGIN)
                 page.evaluate("(mode) => { window.mode = mode; }", mode)
                 expect(page.get_by_text("Source active · Webhook local")).to_be_visible()
+                if mode == "ownership":
+                    refresh = page.get_by_role("button", name="Actualiser la liste")
+                    refresh.click()
+                    expect(page.get_by_text("Ce téléphone est affecté à plusieurs calendriers.", exact=False)).to_be_visible()
+                    expect(page.get_by_text("Source configurée · Téléphone de recette · HTTPS direct")).to_be_visible()
+                    source = page.get_by_role("combobox", name="Nouvelle source pour Calendrier")
+                    expect(source.locator('option[value="reserved"]')).to_have_count(0)
+                    expect(source.locator('option[value=""]')).to_have_text("Webhook local")
+                    page.evaluate("window.ownershipUnavailable = true")
+                    refresh.click()
+                    expect(page.get_by_text("Une entrée indisponible empêche de vérifier les affectations.", exact=False)).to_be_visible()
+                    assert page.evaluate("window.writes") == 0
+                    page.close()
+                    continue
                 page.get_by_role("combobox", name="Nouvelle source pour Calendrier").select_option("phone")
                 page.get_by_role("button", name="Changer la source").click()
                 dialog = page.get_by_role("dialog")
@@ -174,7 +200,7 @@ def main(channel):
                 page.close()
         finally:
             browser.close()
-    print("Six browser scenarios passed, including unverified storage writes for source and label.")
+    print("Seven browser scenarios passed, including ownership conflicts and unavailable entries.")
 
 
 if __name__ == "__main__":

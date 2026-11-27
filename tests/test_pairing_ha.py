@@ -13,17 +13,19 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from aiohttp import ClientConnectionError, ClientSession, TCPConnector, web
 from aiohttp.test_utils import TestServer
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 
 from test_pairing_protocol import comparison_code
+from test_pairing_signed import signed_headers
 from test_receiver import (
-    DiskStore, EXAMPLE, current_request, is_cloud_request, pairing_ha_module, pairing_signed_module,
+    DiskStore, EXAMPLE, RELAY_HEADER, RELAY_TOKEN, WEBHOOK_ID, async_setup_entry, async_unload_entry,
+    current_request, is_cloud_request, pairing_ha_module, pairing_module, pairing_signed_module,
     receiver_module, setup_domain,
 )
 
@@ -168,7 +170,13 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 is_cloud_request.reset(token)
 
+        async def dispatch_webhook(request):
+            key = request.match_info["webhook_id"]
+            handler, _ = self.hass.hooks[key]
+            return await handler(self.hass, key, request)
+
         app.router.add_get("/api/websocket", dispatch_ws)
+        app.router.add_post("/api/webhook/{webhook_id}", dispatch_webhook)
         for path, view in self.hass.views.items():
             method = "GET" if hasattr(view, "get") else "POST"
             app.router.add_route(method, path, dispatch_http)
@@ -181,6 +189,231 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         async with self.client.ws_connect(self.server.make_url("/api/websocket")) as ws:
             await ws.send_json({"id": 1, "type": f"horeveil/pairing_test/{operation}", **fields})
             return await ws.receive_json()
+
+    async def setup_calendars(self, entries):
+        async def platforms(*_):
+            return True
+
+        hass = self.hass
+        hass.is_stopping = False
+        hass.hooks = {}
+        hass.async_add_executor_job = asyncio.to_thread
+        hass.async_create_task = asyncio.create_task
+        hass.config_entries = SimpleNamespace(
+            async_entries=lambda _: entries, async_forward_entry_setups=platforms, async_unload_platforms=platforms,
+        )
+        for entry in entries:
+            await async_setup_entry(hass, entry)
+
+    @staticmethod
+    def calendar_entry(name):
+        return SimpleNamespace(entry_id=name, title=name, data={WEBHOOK_ID: uuid4().hex, RELAY_TOKEN: "recette"})
+
+    async def signed_phone(self):
+        registry = self.hass.data["horeveil.local_pairing_test"].registry
+        key = ec.generate_private_key(ec.SECP256R1())
+        secret = token_bytes(32)
+        installation = uuid4()
+        public_key = key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        invite = await registry.async_invite(administrator_id=self.admin.id, confirmed_origin=_ORIGIN, direct=True)
+        claim = pairing_module.PairingClaim(uuid4(), installation, "Téléphone de recette", sha256(secret).digest())
+        reservation = await registry.async_claim(invite.code, claim, origin=_ORIGIN, direct=True)
+        pairing_id = reservation.pairing_id
+        now = int(datetime.now(UTC).timestamp())
+
+        def verify(*_):
+            return uuid4(), now + 60, now
+
+        await registry.async_direct_request(
+            pairing_id, secret, "enroll", verify,
+            enrollment=(public_key, claim.claim_id, installation, reservation.challenge),
+        )
+        review = await registry.async_review_claim(self.admin, invite.invitation_id)
+        await registry.async_approve_claim(self.admin, pairing_id, review.comparison_code)
+        await registry.async_direct_request(pairing_id, secret, "activate", verify)
+        return SimpleNamespace(id=pairing_id, installation=str(installation), key=key, secret=secret,
+                               server_id=str(reservation.server_id))
+
+    async def select_source(self, entry, phone=None):
+        return await self.ws("calendar_source", entry_id=entry.entry_id,
+                             pairing_id=str(phone.id) if phone else None, confirmed=True)
+
+    @staticmethod
+    def calendar_body(installation, revision):
+        now = datetime.now(UTC)
+        return json.dumps({
+            "schema_version": 1, "event": "calendar_snapshot", "installation_id": installation,
+            "revision": revision, "generated_at": now.isoformat(), "window_start": now.isoformat(),
+            "window_end_exclusive": (now + timedelta(days=30)).isoformat(), "timezone": "UTC",
+            "expires_at": (now + timedelta(hours=1)).isoformat(), "occurrences": [],
+        }).encode()
+
+    async def publish_direct(self, phone, revision):
+        body = self.calendar_body(phone.installation, revision)
+        headers = signed_headers(phone.key, _ORIGIN, "calendar", str(phone.id), phone.server_id, phone.secret, body)
+        async with self.client.post(self.server.make_url(pairing_signed_module.DIRECT_BASE + "/calendar"),
+                                    data=body, headers=headers) as response:
+            result = await response.json()
+            return response.status, result.get("result", result.get("error"))
+
+    async def publish_webhook(self, entry, installation, revision):
+        path = "/api/webhook/" + entry.data[WEBHOOK_ID]
+        async with self.client.post(self.server.make_url(path), data=self.calendar_body(installation, revision),
+                                    headers={RELAY_HEADER: entry.data[RELAY_TOKEN], "Content-Type": "application/json"}) as response:
+            return response.status, (await response.json())["result"]
+
+    async def test_uncertain_assignment_excludes_other_entries_through_reload(self):
+        await self.start(universal=True)
+        a, b = entries = [self.calendar_entry(name) for name in ("a", "b")]
+        await self.setup_calendars(entries)
+        phone = await self.signed_phone()
+        store = a.runtime_data._store
+        with patch.object(store, "async_load", side_effect=OSError):
+            self.assertEqual(await self.select_source(a, phone), {"error": "storage_outcome_unknown"})
+        contender = await self.select_source(b, phone)
+        await async_unload_entry(self.hass, a)
+        self.assertEqual(await self.select_source(b, phone), {"error": "calendar_source_unavailable"})
+        await async_setup_entry(self.hass, a)
+        delivery = await self.publish_direct(phone, 1)
+        self.assertEqual((contender, delivery), (
+            {"error": "calendar_source_unavailable"}, (200, "accepted"),
+        ))
+
+    async def test_uncertain_source_transition_matrix(self):
+        await self.start(universal=True)
+        old_phone, new_phone, independent = [await self.signed_phone() for _ in range(3)]
+        for old, new in ((None, new_phone), (old_phone, None), (old_phone, new_phone)):
+            for persisted in (False, True):
+                with self.subTest(old_is_direct=old is not None, new_is_direct=new is not None, persisted=persisted):
+                    a, b, c = entries = [self.calendar_entry(uuid4().hex) for _ in range(3)]
+                    await self.setup_calendars(entries)
+                    installation = str(uuid4())
+                    if old:
+                        self.assertEqual(await self.select_source(a, old), {"result": {"state": "selected"}})
+                        self.assertEqual(await self.publish_direct(old, 1), (200, "accepted"))
+                    else:
+                        self.assertEqual(await self.publish_webhook(a, installation, 1), (200, "accepted"))
+                    store = a.runtime_data._store
+                    before = store.path.read_bytes()
+                    self.hass.is_stopping = True
+                    try:
+                        self.assertEqual(await self.select_source(a, new), {"error": "calendar_source_unavailable"})
+                    finally:
+                        self.hass.is_stopping = False
+                    self.assertEqual(store.path.read_bytes(), before)
+                    self.assertFalse(a.runtime_data.source_selection_uncertain)
+
+                    failed_step = "async_load" if persisted else "async_save"
+                    with patch.object(store, failed_step, side_effect=OSError):
+                        self.assertEqual(await self.select_source(a, new), {"error": "storage_outcome_unknown"})
+                    durable = store.path.read_bytes()
+                    self.assertEqual(durable != before, persisted)
+                    for candidate in (phone for phone in (old, new) if phone):
+                        self.assertEqual(await self.select_source(b, candidate), {"error": "calendar_source_unavailable"})
+                        self.assertEqual(await self.publish_direct(candidate, 2), (403, "source_not_authorized"))
+                    self.assertEqual(await self.select_source(b, independent), {"result": {"state": "selected"}})
+                    self.assertEqual(await self.publish_direct(independent, 1), (200, "accepted"))
+                    self.assertEqual(await self.publish_webhook(c, installation, 1), (200, "accepted"))
+                    with patch.object(pairing_ha_module, "_https_origins", return_value=[]):
+                        info = (await self.ws("info"))["result"]
+                    self.assertTrue(info["calendars"][0]["source_uncertain"])
+                    self.assertEqual(store.path.read_bytes(), durable)
+
+                    if old and new and not persisted:
+                        self.hass = self.new_ha()
+                        await setup_domain(self.hass, {})
+                        await self.setup_calendars(entries)
+                    else:
+                        await async_unload_entry(self.hass, a)
+                        await async_setup_entry(self.hass, a)
+                    retained, released = (new, old) if persisted else (old, new)
+                    self.assertFalse(a.runtime_data.source_selection_uncertain)
+                    self.assertEqual(a.runtime_data.direct_source, retained.id if retained else None)
+                    self.assertEqual(store.path.read_bytes(), durable)
+                    if retained:
+                        self.assertEqual(await self.select_source(b, retained), {"error": "calendar_source_unavailable"})
+                        self.assertEqual(await self.publish_direct(retained, 2), (200, "accepted"))
+                    else:
+                        self.assertEqual(await self.publish_webhook(a, installation, 2), (200, "accepted"))
+                    if released:
+                        self.assertEqual(await self.select_source(b, released), {"result": {"state": "selected"}})
+                        self.assertEqual(await self.publish_direct(released, 3), (200, "accepted"))
+                    for entry in entries:
+                        await async_unload_entry(self.hass, entry)
+
+    async def test_preexisting_conflict_is_blocked_even_if_an_entry_is_unloaded(self):
+        await self.start(universal=True)
+        phone = await self.signed_phone()
+        a, b, c = entries = [self.calendar_entry(name) for name in ("a", "b", "c")]
+        for entry in (a, b):
+            store = DiskStore(self.hass, 1, f"horeveil.{entry.entry_id}")
+            await store.async_save({
+                "direct_source": str(phone.id),
+                "snapshot": self.calendar_body(phone.installation, 1).decode(),
+            })
+        await self.setup_calendars(entries)
+        a_store, b_store = a.runtime_data._store, b.runtime_data._store
+        before_a, before_b = a_store.path.read_bytes(), b_store.path.read_bytes()
+        await async_unload_entry(self.hass, b)
+        with patch.object(pairing_ha_module, "_https_origins", return_value=[]):
+            info = (await self.ws("info"))["result"]
+        self.assertTrue(info["calendars"][0]["source_conflict"])
+        self.assertIn(str(phone.id), info["calendars"][1]["unavailable_phones"])
+        self.assertEqual(await self.publish_direct(phone, 2), (403, "source_not_authorized"))
+        self.assertEqual(await self.select_source(c, phone), {"error": "calendar_source_unavailable"})
+        with patch.object(pairing_ha_module, "calendar_store", side_effect=OSError):
+            self.assertEqual(await self.publish_direct(phone, 2), (403, "source_not_authorized"))
+            self.assertEqual(await self.select_source(c, phone), {"error": "calendar_source_unavailable"})
+            self.assertEqual(await self.publish_webhook(c, str(uuid4()), 1), (200, "accepted"))
+        self.assertEqual((a_store.path.read_bytes(), b_store.path.read_bytes()), (before_a, before_b))
+        await async_setup_entry(self.hass, b)
+        self.assertEqual(await self.select_source(b), {"result": {"state": "selected"}})
+        self.assertEqual(a_store.path.read_bytes(), before_a)
+        self.assertIsNone((await b_store.async_load())["snapshot"])
+        self.assertEqual(await self.publish_direct(phone, 2), (200, "accepted"))
+
+    async def test_concurrent_assignment_then_revocation_during_uncertainty(self):
+        await self.start(universal=True)
+        phone = await self.signed_phone()
+        a, b = entries = [self.calendar_entry(name) for name in ("a", "b")]
+        await self.setup_calendars(entries)
+        store = a.runtime_data._store
+        entered, queued, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        save = store.async_save
+        registry = self.hass.data["horeveil.local_pairing_test"].registry
+        select = registry.async_select_calendar_source
+
+        async def pause_after_write(data):
+            await save(data)
+            entered.set()
+            await release.wait()
+            raise OSError
+
+        async def observe_selection(source, callback):
+            if entered.is_set():
+                queued.set()
+            await select(source, callback)
+
+        with (patch.object(store, "async_save", pause_after_write),
+              patch.object(registry, "async_select_calendar_source", observe_selection)):
+            first = asyncio.create_task(self.select_source(a, phone))
+            await asyncio.wait_for(entered.wait(), 5)
+            second = asyncio.create_task(self.select_source(b, phone))
+            try:
+                await asyncio.wait_for(queued.wait(), 5)
+                self.assertFalse(second.done())
+            finally:
+                release.set()
+            self.assertEqual(await first, {"error": "storage_outcome_unknown"})
+            self.assertEqual(await second, {"error": "calendar_source_unavailable"})
+        self.assertEqual(await self.ws("revoke", pairing_id=str(phone.id), confirmed=True),
+                         {"error": "registry_unavailable"})
+        self.assertEqual(await self.publish_direct(phone, 1), (401, "invalid_credential"))
+        await async_unload_entry(self.hass, a)
+        await async_setup_entry(self.hass, a)
+        self.assertEqual(await self.select_source(b, phone), {"error": "calendar_source_unavailable"})
+        self.assertEqual(await self.select_source(a), {"result": {"state": "selected"}})
+        self.assertEqual(await self.publish_webhook(a, str(uuid4()), 1), (200, "accepted"))
 
     def unseal(self, ciphertext):
         return self.pinned_key.decrypt(

@@ -134,7 +134,32 @@ def signed_phone(base, pairing_id, server_id, secret, alias):
     return prepare
 
 
-async def exercise_signed(client, origin, admin, guest, entry, backend):
+async def exercise_assignment_reload(hass, ws, entry, selection):
+    """Exercise actual Core setup and unload around a persisted, unverified assignment."""
+    flow = await hass.config_entries.flow.async_init(_DOMAIN, context={"source": "user"})
+    created = await hass.config_entries.flow.async_configure(flow["flow_id"], {})
+    assert created["type"] == "create_entry"
+    await hass.async_block_till_done()
+    other = created["result"]
+    competing = selection | {"entry_id": other.entry_id}
+
+    with patch.object(entry.runtime_data._store, "async_load", side_effect=OSError):
+        failure = await _pair(ws, "calendar_source", **selection)
+    assert failure["error"]["code"] == "storage_outcome_unknown"
+    refused = await _pair(ws, "calendar_source", **competing)
+    assert refused["error"]["code"] == "calendar_source_unavailable"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    refused = await _pair(ws, "calendar_source", **competing)
+    assert refused["error"]["code"] == "calendar_source_unavailable"
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert str(entry.runtime_data.direct_source) == selection["pairing_id"]
+    assert other.runtime_data.direct_source is None
+    assert not entry.runtime_data.source_selection_uncertain
+    print("Affectation Core : refus du concurrent pendant l’incertitude et le déchargement, puis restauration.", flush=True)
+
+
+async def exercise_signed(hass, client, origin, admin, guest, entry, backend, *, assignment_reload=False):
     base = origin + "/api/horeveil/direct/v1/"
     alias = ec.generate_private_key(ec.SECP256R1())
     await check_request(client, "POST", base + "status", 401, headers={"X-Horeveil-Relay-Secret": "invalid"})
@@ -174,7 +199,10 @@ async def exercise_signed(client, origin, admin, guest, entry, backend):
         await check_request(client, "POST", calendar, 401, json=body)
         await check_request(client, "POST", calendar, 403, **prepare("calendar", body))
         selection = {"entry_id": entry.entry_id, "pairing_id": pairing_id, "confirmed": True}
-        assert (await _pair(ws, "calendar_source", **selection))["success"]
+        if assignment_reload:
+            await exercise_assignment_reload(hass, ws, entry, selection)
+        else:
+            assert (await _pair(ws, "calendar_source", **selection))["success"]
         signed = prepare("calendar", body)
         assert (await check_request(client, "POST", calendar, 200, **signed))["result"] == "accepted"
         await check_request(client, "POST", calendar, 401, **signed)
@@ -308,7 +336,7 @@ async def relay_tcp(reader, writer, nginx_port):
         writer.close()
 
 
-async def run(profile, nginx, stock, through_proxy, signed, adb=None, android_serial=None):
+async def run(profile, nginx, stock, through_proxy, signed, adb=None, android_serial=None, *, assignment_reload=False):
     _certificate_files(profile, nginx=False)
     core_port, proxy_port = _free_port(), _free_port()
     backend = f"{'http' if through_proxy else 'https'}://127.0.0.1:{core_port}"
@@ -372,7 +400,8 @@ http {{ server {{ listen 127.0.0.1:{proxy_port} ssl proxy_protocol;
                 await check_request(client, method, url, 400,
                                     headers={"X-Forwarded-For": "127.0.0.1", "X-Forwarded-Proto": "https"})
             if signed:
-                await exercise_signed(client, origin, admin, guest, entry, backend)
+                await exercise_signed(hass, client, origin, admin, guest, entry, backend,
+                                      assignment_reload=assignment_reload)
                 if adb is not None:
                     await exercise_android(client, origin, admin, entry, profile, adb, android_serial)
             else:
@@ -403,11 +432,14 @@ if __name__ == "__main__":
     parser.add_argument("--nginx", type=Path)
     parser.add_argument("--stock-proxy", type=Path)
     parser.add_argument("--signed", action="store_true", help="Exercise the installed signed profile instead of the qualification probe")
+    parser.add_argument("--assignment-reload", action="store_true", help="Inject a Store read failure and exercise real entry unload/setup")
     parser.add_argument("--adb", type=Path, help="Use the existing app and test APKs on a disposable emulator")
     parser.add_argument("--android-serial")
     args = parser.parse_args()
     if bool(args.nginx) != bool(args.stock_proxy):
         parser.error("--nginx and --stock-proxy are required together")
+    if args.assignment_reload and (not args.signed or args.nginx or args.adb or args.android_serial):
+        parser.error("--assignment-reload requires --signed with direct HTTPS")
     if args.adb or args.android_serial:
         if not args.adb or not args.android_serial or not args.android_serial.startswith("emulator-") or not args.signed or args.nginx:
             parser.error("Android requires --signed, --adb, --android-serial emulator-PORT and direct HTTPS")
@@ -415,4 +447,4 @@ if __name__ == "__main__":
         profile = Path(name)
         copytree(_ROOT / "custom_components" / _DOMAIN, profile / "custom_components" / _DOMAIN)
         asyncio.run(run(profile, args.nginx, args.stock_proxy, bool(args.nginx), args.signed,
-                        args.adb, args.android_serial))
+                        args.adb, args.android_serial, assignment_reload=args.assignment_reload))

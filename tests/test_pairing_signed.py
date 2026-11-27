@@ -75,7 +75,10 @@ class SignedPairingTests(unittest.IsolatedAsyncioTestCase):
         if operation == "claim":
             return await self.http.claim(request)
         if operation == "calendar":
-            return await self.http.calendar(request, self.hass, lambda _: self.receiver)
+            async def find_receiver(_):
+                return self.receiver
+
+            return await self.http.calendar(request, self.hass, find_receiver)
         return await self.http.signed(request, operation)
 
     async def reserve(self, *, direct=True):
