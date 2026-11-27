@@ -13,6 +13,7 @@ from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN, RELAY_HEADER
 from .snapshot import MAX_BYTES, Snapshot, decode_snapshot
+from .storage import HoreveilStore, StoreReadError, async_load_store
 
 
 def _reply(status: HTTPStatus, result: str) -> web.Response:
@@ -26,10 +27,33 @@ class SnapshotRequestError(ValueError):
 
 
 def calendar_store(hass: HomeAssistant, entry_id: str) -> Store:
-    return Store(
+    return HoreveilStore(
         hass, 1, f"{DOMAIN}.{entry_id}", private=True,
         atomic_writes=True, serialize_in_event_loop=False,
     )
+
+
+async def async_load_calendar_store(store: Store) -> tuple[dict, UUID | None]:
+    """Validate the fields used to restore the receiver and resolve ownership."""
+    stored = await async_load_store(store)
+    if stored is None:
+        return {}, None
+    source = stored.get("direct_source")
+    watermarks = stored.get("direct_watermarks", {})
+    if (
+        not ("snapshot" in stored or "direct_source" in stored)
+        or any(stored.get(field) is not None and not isinstance(stored[field], str)
+            for field in ("direct_source", "snapshot", "received_at"))
+        or not isinstance(watermarks, dict)
+        or any(type(revision) is not int or revision < 1 for revision in watermarks.values())
+    ):
+        raise StoreReadError("invalid")
+    try:
+        for pairing_id in watermarks:
+            UUID(pairing_id)
+        return stored, UUID(source) if source is not None else None
+    except (AttributeError, TypeError, ValueError):
+        raise StoreReadError("invalid") from None
 
 
 async def async_read_snapshot_body(request: web.Request) -> bytes:
@@ -90,23 +114,20 @@ class SnapshotReceiver:
 
     async def async_restore(self) -> None:
         """Restore the payload and its source/revision watermark."""
-        stored = await self._store.async_load()
-        if stored is not None:
-            if source := stored.get("direct_source"):
-                self.direct_source = UUID(source)
-            self._direct_watermarks = stored.get("direct_watermarks", {})
-            if stored.get("snapshot") is not None:
-                self._last = await self._hass.async_add_executor_job(
-                    decode_snapshot, stored["snapshot"].encode("utf-8")
-                )
-            if isinstance(value := stored.get("received_at"), str):
-                try:
-                    received_at = datetime.fromisoformat(value)
-                except ValueError:
-                    pass
-                else:
-                    if received_at.tzinfo is not None:
-                        self.received_at = received_at.astimezone(UTC)
+        stored, self.direct_source = await async_load_calendar_store(self._store)
+        self._direct_watermarks = stored.get("direct_watermarks", {})
+        if stored.get("snapshot") is not None:
+            self._last = await self._hass.async_add_executor_job(
+                decode_snapshot, stored["snapshot"].encode("utf-8")
+            )
+        if isinstance(value := stored.get("received_at"), str):
+            try:
+                received_at = datetime.fromisoformat(value)
+            except ValueError:
+                pass
+            else:
+                if received_at.tzinfo is not None:
+                    self.received_at = received_at.astimezone(UTC)
 
     async def async_close(self) -> None:
         """Prevent new writes and wait for an existing commit to finish."""

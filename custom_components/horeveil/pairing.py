@@ -20,6 +20,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN
+from .storage import HoreveilStore, async_load_store
 
 if TYPE_CHECKING:
     from homeassistant.auth.models import User
@@ -252,7 +253,7 @@ def _invitation_digest(code: str) -> bytes:
     return sha256(code.encode("ascii")).digest()
 
 
-class _BackupExcludedStore(Store):
+class _BackupExcludedStore(HoreveilStore):
     @property
     def path(self) -> str:
         return self.hass.config.path(self.key)
@@ -296,7 +297,7 @@ class PairingRegistry:
         if registry is None:
             options = {"private": True, "atomic_writes": True}
             registry = cls(
-                Store(hass, 1, f"{DOMAIN}.pairings", **options),
+                HoreveilStore(hass, 1, f"{DOMAIN}.pairings", **options),
                 _BackupExcludedStore(hass, 1, f".cache/{DOMAIN}.pairing_guard", **options),
                 replay=_BackupExcludedStore(hass, 1, f".cache/{DOMAIN}.pairing_replay", **options),
             )
@@ -316,7 +317,14 @@ class PairingRegistry:
             if self._available:
                 return
             self._invitations.clear()
-            stored = await self._store.async_load()
+            stored = await async_load_store(self._store)
+            guard = await async_load_store(self._guard)
+            if guard is not None:
+                try:
+                    if set(guard) != {"generation"} or str(UUID(guard["generation"])) != guard["generation"]:
+                        raise ValueError
+                except (AttributeError, TypeError, ValueError):
+                    raise PairingError("Invalid pairing guard") from None
             if stored is None:
                 await self._commit(uuid4(), {})
                 return
@@ -341,7 +349,7 @@ class PairingRegistry:
                     associations[association.pairing_id] = association
             except (AttributeError, KeyError, TypeError, ValueError):
                 raise PairingError("Invalid pairing registry") from None
-            if await self._guard.async_load() != {"generation": generation}:
+            if guard != {"generation": generation}:
                 await self._commit(server_id, {
                     key: association.revoked() for key, association in associations.items()
                 })
@@ -532,7 +540,7 @@ class PairingRegistry:
         store = self._replay
         if store is None:
             raise PairingError("Replay protection unavailable")
-        saved = await store.async_load()
+        saved = await async_load_store(store)
         if saved is None:
             if self._replay_ready or any(assoc.public_key is not None for assoc in self._associations.values()):
                 raise PairingError("Replay state unavailable")

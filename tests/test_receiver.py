@@ -278,12 +278,50 @@ with patch.dict(
     from custom_components.horeveil import pairing_signed as pairing_signed_module
     from custom_components.horeveil import async_setup as setup_domain
     from custom_components.horeveil import receiver as receiver_module
+    from custom_components.horeveil.storage import StoreReadError
     from custom_components.horeveil.sensor import async_setup_entry as setup_sensors
     from custom_components.horeveil.snapshot import MAX_BYTES
 
 
 CONTRACT = Path(__file__).resolve().parents[1] / "docs" / "CALENDAR_SNAPSHOT_SCHEMA_V1.md"
 EXAMPLE = json.loads(CONTRACT.read_text("utf-8").split("```json\n", 1)[1].split("```", 1)[0])
+
+
+class CalendarStoreReadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_absence_invalid_data_and_quarantine(self):
+        directory = self.enterContext(TemporaryDirectory(dir=Path(__file__).resolve().parents[1]))
+        store = DiskStore(SimpleNamespace(directory=Path(directory)), 1, "calendar")
+        read = receiver_module.async_load_calendar_store
+        self.assertEqual(await read(store), ({}, None))
+        quarantine = store.path.with_name("calendar.corrupt.recette")
+        quarantine.write_bytes(b"{")
+        for _ in range(2):
+            with self.assertRaises(StoreReadError) as error:
+                await read(store)
+            self.assertEqual(error.exception.reason, "quarantined")
+        self.assertFalse(store.path.exists())
+        self.assertEqual(quarantine.read_bytes(), b"{")
+        for data in ([], {"unknown": True}, {"direct_source": ""}, {"snapshot": 1},
+                     {"direct_source": None, "direct_watermarks": {"invalid": 1}}):
+            with self.subTest(data=data):
+                await store.async_save(data)
+                with self.assertRaises(StoreReadError) as error:
+                    await read(store)
+                self.assertEqual(error.exception.reason, "invalid")
+        await store.async_save({"direct_source": "00000000-0000-0000-0000-000000000001"})
+        writes = store.writes
+        self.assertEqual(str((await read(store))[1]), "00000000-0000-0000-0000-000000000001")
+        for returned, side_effect, reason in (
+            (None, None, "indeterminate"),
+            (None, PermissionError, "unavailable"),
+            (None, NotImplementedError, "unavailable"),
+        ):
+            with patch.object(store, "async_load", return_value=returned, side_effect=side_effect):
+                with self.assertRaises(StoreReadError) as error:
+                    await read(store)
+                self.assertEqual(error.exception.reason, reason)
+        self.assertEqual(store.writes, writes)
+        self.assertEqual(quarantine.read_bytes(), b"{")
 
 
 class ReceiverTests(unittest.IsolatedAsyncioTestCase):

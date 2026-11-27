@@ -142,6 +142,22 @@ class PairingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(await self.registry.async_authenticate(entry.pairing_id, secret))
                 self.assertEqual((await self.store.async_load())["associations"][0]["state"], "revoked")
 
+    async def test_quarantined_registry_or_guard_does_not_erase_recoverable_associations(self):
+        entry, secret = await self.activate(await self.invite())
+        for store in (self.store, self.guard):
+            with self.subTest(store=store.key):
+                original = store.path.read_bytes()
+                quarantine = store.path.with_name(store.path.name + ".corrupt.recette")
+                store.path.rename(quarantine)
+                for _ in range(2):
+                    with self.assertRaisesRegex(OSError, "quarantined"):
+                        await self.open_registry()
+                self.assertFalse(store.path.exists())
+                self.assertEqual(quarantine.read_bytes(), original)
+                store.path.write_bytes(original)
+                _, restored = await self.open_registry()
+                self.assertEqual(await restored.async_authenticate(entry.pairing_id, secret), entry)
+
     async def test_silent_store_failure_is_detected_and_does_not_restore_access(self):
         entry, secret = await self.activate(await self.invite())
         self.store.fail = True

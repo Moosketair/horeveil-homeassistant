@@ -562,7 +562,7 @@ class HoreveilAssociation extends HTMLElement {
       const warning = document.createElement("p");
       warning.textContent = entry.source_conflict
         ? "Ce téléphone est affecté à plusieurs calendriers. Les envois signés sont bloqués. Changez explicitement la source d’une des entrées."
-        : "Une entrée indisponible empêche de vérifier les affectations. Rechargez-la pour rétablir les envois signés.";
+        : "Une entrée indisponible empêche de vérifier les affectations. Vérifiez son stockage et restaurez une sauvegarde si nécessaire, puis rechargez l’intégration.";
       for (const [value, title] of choices) {
         const option = document.createElement("option");
         option.value = value;

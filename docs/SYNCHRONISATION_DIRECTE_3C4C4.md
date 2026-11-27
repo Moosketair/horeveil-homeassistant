@@ -286,3 +286,68 @@ restent utilisables.
 Résultats sous Windows : 46 tests Python d’association et 30 tests de
 récepteur réussis avec Python 3.13. Sept scénarios Chrome avec Playwright
 1.65.2 et le contrôle de syntaxe JavaScript ont réussi.
+
+## Étape 3C4C.6.4 — Lecture sûre du stockage et récupération
+
+La sonde sur `ada94b1` reproduit la corruption avec le Store réel. Core
+déplace le JSON de A en quarantaine et renvoie `None`. B accepte alors le
+téléphone. La restauration de A crée un conflit et l’envoi signé reçoit
+`403 source_not_authorized`.
+
+Le lecteur commun vérifie l’absence sur disque avant de lui donner un sens.
+Il est utilisé par la restauration des récepteurs, le décompte des
+affectations des entrées déchargées et les lectures initiales du registre,
+de sa garde et de l’état anti-rejeu. Le panneau signale l’indisponibilité et
+indique la restauration du stockage. La règle d’unicité de 3C4C.6.3 reste
+applicable.
+
+| Observation | Traitement |
+| --- | --- |
+| Valeur valide | Elle fait autorité. Une quarantaine historique peut rester à côté du fichier restauré. |
+| `None`, fichier principal absent et aucune trace de quarantaine | Absence confirmée. Une nouvelle entrée peut commencer avec le webhook. |
+| `None` avec un fichier voisin `.corrupt.*` | Quarantaine détectée à chaque lecture, y compris après redémarrage. |
+| `None` avec fichier principal présent | Résultat indéterminé. Cela couvre notamment un cache négatif de Core ou une lecture en mode `load_empty`. |
+| Erreur d’accès ou version majeure non lisible | Stockage indisponible. |
+| Valeur ou format d’affectation invalide | Lecture refusée. |
+
+Les Stores Horéveil concernés n’activent pas `load_empty` et utilisent le
+format 1.1. Le point d’extension de migration de Core refuse les versions
+inconnues. Il évite la réécriture par défaut d’une version mineure dont
+Horéveil ne connaît pas le format. L’examen de Core 2026.10.0 et 2026.11.2
+confirme la convention de quarantaine et les branches de lecture utilisées.
+[Store 2026.10.0](https://github.com/home-assistant/core/blob/2026.10.0/homeassistant/helpers/storage.py#L311-L427)
+· [Store 2026.11.2](https://github.com/home-assistant/core/blob/2026.11.2/homeassistant/helpers/storage.py#L406-L515)
+
+Une entrée dont l’affectation est illisible ne peut pas être chargée comme
+webhook vide. Les opérations signées susceptibles de la concerner restent
+bloquées, tandis que les webhooks des entrées indépendantes fonctionnent.
+Pour récupérer, conserver le fichier de quarantaine, restaurer une sauvegarde
+valide de l’entrée avec Core arrêté, puis redémarrer et actualiser le panneau.
+Si la restauration révèle deux affectations valides au même téléphone, les
+envois signés restent bloqués jusqu’au choix explicite d’une autre source
+sur l’une des entrées. La lecture seule ne modifie ni le Store valide ni la
+projection.
+
+La sonde permanente se lance avec `python tests/real_storage_recovery.py`
+dans l’environnement Core 2026.11.2. L’option `--baseline` rejoue le défaut
+sur le code archivé de `ada94b1`. Sur Windows, la recette fournit uniquement
+une date compatible avec les noms de fichiers locaux. Le décodage JSON,
+le renommage en quarantaine et le retour `None` sont ceux du Store réel.
+Sans cet ajustement sur Windows, le nom de quarantaine est refusé par le
+système de fichiers. Le lecteur classe alors le Store comme indisponible
+et le fichier corrompu reste en place.
+
+Sur Core 2026.11.2, la sonde corrigée a vérifié le refus de B après la
+quarantaine, après lectures répétées, après rechargement et après l’arrêt
+puis le redémarrage de Core sur le même profil. Le webhook indépendant a
+accepté un instantané. La restauration valide a rendu les envois à A,
+conservé la quarantaine et confirmé que la relecture ne réécrit pas le
+Store. Un conflit restauré a été refusé puis résolu par le choix explicite
+du webhook sur B. La sonde du Store réel a aussi vérifié l’absence
+légitime, le refus d’une version mineure inconnue et le cas `load_empty`
+avec fichier présent.
+
+Sous Windows, 47 tests Python d’association et 31 tests de réception ou
+de lecture ont réussi avec Python 3.13. Les sept scénarios Chrome avec
+Playwright et le contrôle de syntaxe JavaScript ont réussi. Les sondes
+Core ont utilisé Python 3.14. Le lot est remis pour contre-vérification ciblée.

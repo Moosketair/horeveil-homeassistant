@@ -31,7 +31,7 @@ from .const import CALENDAR_RECEIVERS, DOMAIN, PAIRING_RUNTIME as _RUNTIME_KEY
 from .pairing import InvalidPairingCredential, PairingError, PairingRegistry, _persist, validate_origin
 from .pairing_http import PairingHttp
 from .pairing_native import NativePairingIngress
-from .receiver import calendar_store
+from .receiver import async_load_calendar_store, calendar_store
 from .pairing_proxy import PAIRING_BASE, FINGERPRINT, PairingProxy, build_proxy_tls, direct_tls, pinned_certificate
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,16 +60,9 @@ async def _calendar_owners(hass: HomeAssistant) -> dict[UUID, set[str]] | None:
         if entry.entry_id in receivers:
             continue
         try:
-            stored = await calendar_store(hass, entry.entry_id).async_load()
-            if stored is None:
-                continue
-            if not isinstance(stored, dict):
-                return None
-            source = stored.get("direct_source")
+            _, source = await async_load_calendar_store(calendar_store(hass, entry.entry_id))
             if source is not None:
-                if not isinstance(source, str):
-                    return None
-                owners.setdefault(UUID(source), set()).add(entry.entry_id)
+                owners.setdefault(source, set()).add(entry.entry_id)
         except (HomeAssistantError, OSError, ValueError):
             return None
     return owners
