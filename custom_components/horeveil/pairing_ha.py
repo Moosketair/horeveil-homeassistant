@@ -28,7 +28,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 
 from .const import CALENDAR_RECEIVERS, DOMAIN, PAIRING_RUNTIME as _RUNTIME_KEY
-from .pairing import InvalidPairingCredential, PairingError, PairingRegistry, validate_origin
+from .pairing import InvalidPairingCredential, PairingError, PairingRegistry, _persist, validate_origin
 from .pairing_http import PairingHttp
 from .pairing_native import NativePairingIngress
 from .pairing_proxy import PAIRING_BASE, FINGERPRINT, PairingProxy, build_proxy_tls, direct_tls, pinned_certificate
@@ -63,7 +63,7 @@ def _supports_admin_tls(server) -> bool:
 
 class _PairingRuntime:
     def __init__(
-        self, registry: PairingRegistry, fingerprint: bytes | None, port: int, *,
+        self, hass: HomeAssistant, registry: PairingRegistry, fingerprint: bytes | None, port: int, *,
         local_test: bool, proxy: PairingProxy | NativePairingIngress | None,
     ) -> None:
         self.registry = registry
@@ -73,7 +73,10 @@ class _PairingRuntime:
         self.proxy = proxy
         self.http = PairingHttp(registry, local_source=self.local_source, origin=self.origin)
         self.universal = False
-        self.labels: Store[dict[str, str]]
+        self.labels: Store[dict[str, str]] = Store(
+            hass, 1, f"{DOMAIN}.pairing_labels", private=True, atomic_writes=True,
+        )
+        # Label operations take this lock before consulting or revoking in the registry.
         self.labels_lock = Lock()
 
     @property
@@ -106,6 +109,43 @@ class _PairingRuntime:
         if self.proxy is not None:
             await self.proxy.async_disable()
         await self.registry.async_discard_invitations()
+
+    async def async_load_labels(self) -> dict[str, str]:
+        labels = await self.labels.async_load()
+        if labels is None:
+            return {}
+        if not isinstance(labels, dict):
+            raise PairingError("Invalid phone labels")
+        return labels
+
+    async def async_save_labels(self, labels: dict[str, str]) -> None:
+        if getattr(self.labels.hass, "is_stopping", False):
+            raise PairingError("Home Assistant is stopping")
+        await self.labels.async_save(labels)
+        if await self.labels.async_load() != labels:
+            raise PairingError("Unable to persist phone labels")
+
+    async def async_prune_labels(self) -> None:
+        """Reconcile the display store with the authoritative registry under labels_lock."""
+        try:
+            previous = await self.async_load_labels()
+            if previous:
+                active = {str(phone) for phone in await self.registry.async_list_active()}
+                labels = {key: value for key, value in previous.items() if key in active}
+                if labels != previous:
+                    await self.async_save_labels(labels)
+        except (HomeAssistantError, OSError, ValueError):
+            _LOGGER.warning("Horéveil could not clean up stored phone labels")
+
+
+def _configured_https_origin(hass: HomeAssistant) -> str | None:
+    for candidate in (hass.config.external_url, getattr(hass.config, "internal_url", None)):
+        if candidate:
+            try:
+                return validate_origin(candidate)
+            except PairingError:
+                continue
+    return None
 
 
 def _https_origins(hass) -> list[str]:
@@ -348,31 +388,28 @@ async def _info(hass, connection, msg) -> None:
     operation = _AdminOperation(hass, connection, msg)
     if not operation.authorized:
         return
-    configured_url = hass.config.external_url
-    try:
-        suggestion = validate_origin(configured_url) if configured_url else None
-    except PairingError:
-        suggestion = None
-    try:
-        active = await operation.test.registry.async_list_active()
-    except PairingError:
-        operation.error("registry_unavailable")
-        return
+    suggestion = _configured_https_origin(hass)
+    async with operation.test.labels_lock:
+        try:
+            active = await operation.test.registry.async_list_active()
+            signed = await operation.test.registry.async_list_active(signed_only=True) if operation.test.universal else ()
+        except PairingError:
+            operation.error("registry_unavailable")
+            return
+        try:
+            labels = await operation.test.async_load_labels() if active else {}
+        except (HomeAssistantError, OSError, ValueError):
+            labels = {}
+    phones = [str(pairing_id) for pairing_id in active]
     result = {
         "suggested_origin": suggestion or operation.test.origin,
         "test_origin": operation.test.origin,
-        "phones": [str(pairing_id) for pairing_id in active],
+        "phones": phones,
     }
     if active:
-        async with operation.test.labels_lock:
-            try:
-                labels = await operation.test.labels.async_load() or {}
-            except (HomeAssistantError, OSError, ValueError):
-                labels = {}
-        if isinstance(labels, dict):
-            result["phone_labels"] = {
-                key: labels[key] for key in result["phones"] if isinstance(labels.get(key), str)
-            }
+        result["phone_labels"] = {
+            key: labels[key] for key in phones if isinstance(labels.get(key), str)
+        }
     if operation.test.proxy is not None:
         result.update(direct_configured=True, direct_origin=operation.test.proxy.origin)
     if (native := operation.test.native) is not None:
@@ -380,9 +417,7 @@ async def _info(hass, connection, msg) -> None:
     if operation.test.universal:
         result["https_origins"] = origins = _https_origins(hass)
         result["suggested_origin"] = origins[0] if origins else None
-        result["calendar_phones"] = [
-            str(pairing_id) for pairing_id in await operation.test.registry.async_list_active(signed_only=True)
-        ]
+        result["calendar_phones"] = [str(pairing_id) for pairing_id in signed]
         result["calendars"] = [
             {
                 "entry_id": entry.entry_id,
@@ -415,12 +450,7 @@ async def _rename(hass, connection, msg) -> None:
             if phone_id not in active:
                 operation.error("phone_unavailable")
                 return
-            store = operation.test.labels
-            previous = await store.async_load()
-            if previous is None:
-                previous = {}
-            if not isinstance(previous, dict):
-                raise PairingError("Invalid phone labels")
+            previous = await operation.test.async_load_labels()
             labels = {
                 key: value for key, value in previous.items()
                 if key in active and isinstance(value, str)
@@ -430,12 +460,8 @@ async def _rename(hass, connection, msg) -> None:
             else:
                 labels.pop(phone_id, None)
             if labels != previous:
-                if getattr(hass, "is_stopping", False):
-                    raise PairingError("Home Assistant is stopping")
-                await store.async_save(labels)
-                if await store.async_load() != labels:
-                    raise PairingError("Unable to persist phone labels")
-        operation.result({"state": "renamed"})
+                await _persist(lambda: operation.test.async_save_labels(labels))
+            operation.result({"state": "renamed"})
     except (HomeAssistantError, OSError, ValueError):
         operation.error("rename_unavailable")
 
@@ -488,11 +514,20 @@ async def _revoke(hass, connection, msg) -> None:
             if not all(cleaned):
                 raise PairingError("Calendar storage unavailable")
 
-        revoked = await operation.test.registry.async_revoke(_uuid(msg.get("pairing_id")), purge=purge)
-        if revoked:
-            operation.result({"state": "revoked"})
-        else:
-            operation.error("phone_unavailable")
+        pairing_id = _uuid(msg.get("pairing_id"))
+
+        async def revoke():
+            try:
+                revoked = await operation.test.registry.async_revoke(pairing_id, purge=purge)
+            finally:
+                await operation.test.async_prune_labels()
+            if revoked:
+                operation.result({"state": "revoked"})
+            else:
+                operation.error("phone_unavailable")
+
+        async with operation.test.labels_lock:
+            await _persist(revoke)
     except (HomeAssistantError, OSError, ValueError):
         operation.error("registry_unavailable")
 
@@ -575,7 +610,7 @@ async def async_setup_local_pairing(
             _LOGGER.warning("Horéveil native pairing is disabled: incompatible proxy configuration")
             return
     test = _PairingRuntime(
-        registry, bytes.fromhex(admin_fingerprint) if admin_fingerprint is not None else None,
+        hass, registry, bytes.fromhex(admin_fingerprint) if admin_fingerprint is not None else None,
         server.server_port, local_test=bool(local_test), proxy=proxy,
     )
     if universal:
@@ -608,7 +643,6 @@ async def async_setup_local_pairing(
     if local_test or test.native is not None:
         for view in (_ClaimView, _StatusView, _ActivateView):
             server.register_view(view(test))
-    test.labels = Store(hass, 1, f"{DOMAIN}.pairing_labels", private=True, atomic_writes=True)
     for command in (_invite, _status, _approve, _cancel, _info, _rename, _revoke):
         websocket_api.async_register_command(hass, command)
     if universal:
@@ -617,6 +651,8 @@ async def async_setup_local_pairing(
         websocket_api.async_register_command(hass, _direct_access)
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, test.stop)
     hass.data[_RUNTIME_KEY] = test
+    async with test.labels_lock:
+        await test.async_prune_labels()
     if "frontend" in hass.config.components:
         server.register_view(_PanelModuleView(test))
         server.register_view(_QrModuleView(test))
@@ -624,4 +660,5 @@ async def async_setup_local_pairing(
             hass, frontend_url_path=_PANEL, webcomponent_name=_PANEL,
             sidebar_title="Horéveil", sidebar_icon="mdi:alarm",
             module_url=_PANEL_MODULE, require_admin=True, config_panel_domain=DOMAIN,
+            config={"https_origin": _configured_https_origin(hass)},
         )

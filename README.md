@@ -2,7 +2,7 @@
 
 Horéveil reçoit les instantanés `calendar_snapshot` v1 de l’application Android par synchronisation directe ou via un relais local comme Node-RED. Chaque entrée expose un calendrier en lecture seule et quatre capteurs alimentés par son dernier instantané valide.
 
-Version de recette **0.4.0-beta.1** pour Home Assistant **2026.10 ou ultérieur**. La version stable **0.3.0** reste disponible sur `main`.
+Version de recette **0.4.0-beta.2** pour Home Assistant **2026.10 ou ultérieur**, préparée localement. La version stable **0.3.0** reste disponible sur `main`. [Notes de la préversion](docs/SYNCHRONISATION_DIRECTE_3C4C4.md#notes-de-version-040-beta2).
 
 Ce dépôt est distribué sous [licence MIT](LICENSE).
 
@@ -21,7 +21,7 @@ Consultez la [documentation Marketplace](https://www.home-assistant.io/integrati
 
 1. Dans **HACS → ⋮ → Dépôts personnalisés**, ajoutez [Moosketair/horeveil-homeassistant](https://github.com/Moosketair/horeveil-homeassistant) avec le type **Intégration**.
 2. Sauvegardez Home Assistant et relevez les identifiants des cinq entités Horéveil. Conservez l’entrée d’intégration existante.
-3. Dans **Horéveil → ⋮ → Retélécharger** (ou **Télécharger** à la première installation), ouvrez **Besoin d’une autre version ?**, choisissez **0.4.0-beta.1** et redémarrez Home Assistant.
+3. Dans **Horéveil → ⋮ → Retélécharger** (ou **Télécharger** à la première installation), ouvrez **Besoin d’une autre version ?**, choisissez **0.4.0-beta.2** après sa publication et redémarrez Home Assistant. La **0.4.0-beta.1** reste disponible jusque-là.
 4. Vérifiez le calendrier, les quatre capteurs et le webhook local avant de sélectionner un téléphone comme source directe. Le [guide de recette](docs/SYNCHRONISATION_DIRECTE_3C4C4.md) détaille la sauvegarde, le retour arrière et les premiers essais Android.
 
 Consultez la [documentation HACS](https://hacs.netlify.app/docs/faq/custom_repositories/).

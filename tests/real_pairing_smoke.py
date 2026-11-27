@@ -3,6 +3,7 @@
 import asyncio
 from argparse import ArgumentParser
 from base64 import b64decode, urlsafe_b64decode, urlsafe_b64encode
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import digest
@@ -10,6 +11,7 @@ from io import BytesIO
 from ipaddress import IPv4Address
 import json
 import os
+import re
 from pathlib import Path
 from secrets import token_bytes
 from shutil import copytree
@@ -102,11 +104,17 @@ def _decode_code(ciphertext, key):
     ).decode("ascii")
 
 
-def _comparison(reservation, claim_id, secret):
-    message = "|".join((
-        "horeveil-pair-v1", reservation["server_id"], reservation["pairing_id"],
-        claim_id, reservation["challenge"],
-    ))
+def _comparison(reservation, claim_id, secret, *, installation_id=None, origin=None, public_key=None):
+    if public_key is None:
+        message = "|".join((
+            "horeveil-pair-v1", reservation["server_id"], reservation["pairing_id"],
+            claim_id, reservation["challenge"],
+        ))
+    else:
+        message = "\n".join((
+            "horeveil-direct-compare-v1", reservation["server_id"], reservation["pairing_id"],
+            installation_id, claim_id, reservation["challenge"], origin, _b64(sha256(public_key).digest()),
+        ))
     value = int.from_bytes(digest(sha256(secret).digest(), message.encode("ascii"), "sha256")[:5], "big")
     alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
     return "".join(alphabet[(value >> shift) & 31] for shift in range(35, -1, -5))
@@ -414,7 +422,6 @@ async def _test_browser_qr(hass, panel, profile, origin):
     from playwright.async_api import expect
 
     await panel.locator("#origin").fill(origin)
-    await expect(panel.locator("#host")).to_have_text(origin.removeprefix("https://"))
     await expect(panel.locator("#direct-toggle")).to_be_disabled()
     await panel.locator("#direct-confirm").check()
     await panel.locator("#direct-toggle").click()
@@ -442,7 +449,7 @@ async def _test_browser_qr(hass, panel, profile, origin):
         async with await send(original) as response:
             assert response.status == 401
         await panel.locator("#cancel").click()
-        await expect(panel.locator("#notice")).to_have_text("Invitation annulée.")
+        await expect(panel.locator("#notice")).to_contain_text("Invitation annulée.")
         await expect(panel.locator("#qr")).to_be_hidden()
         assert await panel.locator("#qr-canvas").evaluate("(canvas) => canvas.width") == 0
         async with await send(replacement) as response:
@@ -466,7 +473,7 @@ async def _test_browser_qr(hass, panel, profile, origin):
         await expect(panel.locator("#qr")).to_be_hidden()
         assert await panel.locator("#qr-canvas").evaluate("(canvas) => canvas.width") == 0
         await panel.locator("#cancel").click()
-        await expect(panel.locator("#notice")).to_have_text("Invitation annulée.")
+        await expect(panel.locator("#notice")).to_contain_text("Invitation annulée.")
     await panel.locator("#direct-toggle").click()
     await expect(panel.locator("#direct-state")).to_have_text("Accès direct désactivé")
 
@@ -530,6 +537,7 @@ async def _test_browser(hass, profile, origin, admin, channel, component, direct
                       const panel = document.createElement(name);
                       document.body.append(host);
                       host.append(panel);
+                      panel.panel = hass.panels[name];
                       panel.hass = hass;
                     }""", _PANEL)
                 else:
@@ -539,7 +547,6 @@ async def _test_browser(hass, profile, origin, admin, channel, component, direct
                 panel = page.locator(_PANEL)
                 initial_origin = direct_origin if native else _SUGGESTED
                 await expect(panel.locator("#origin")).to_have_value(initial_origin)
-                await expect(panel.locator("#host")).to_have_text(initial_origin.removeprefix("https://"))
                 await expect(panel.locator("#create")).to_be_disabled()
                 if direct_origin:
                     await _test_browser_qr(hass, panel, profile, direct_origin)
@@ -547,8 +554,6 @@ async def _test_browser(hass, profile, origin, admin, channel, component, direct
                     return
                 await panel.locator("#origin").fill(origin)
                 await expect(panel.locator("#create")).to_be_enabled()
-                await expect(panel.locator("input[value=read]")).to_be_checked()
-                assert await panel.locator("fieldset input:checked").count() == 0
                 await expect(panel.locator("#qr")).to_be_hidden()
                 assert await panel.locator("#qr-canvas").evaluate("(canvas) => canvas.width") == 0
 
@@ -559,11 +564,11 @@ async def _test_browser(hass, profile, origin, admin, channel, component, direct
                 await create()
                 await expect(panel.locator("#qr-unavailable")).to_be_visible()
                 await panel.locator("#cancel").click()
-                await expect(panel.locator("#notice")).to_have_text("Invitation annulée.")
+                await expect(panel.locator("#notice")).to_contain_text("Invitation annulée.")
                 await create()
                 registry = hass.data["horeveil.local_pairing_test"].registry
                 with patch.object(registry, "_clock", lambda: monotonic() + 300):
-                    await expect(panel.locator("#notice")).to_have_text("Invitation indisponible.")
+                    await expect(panel.locator("#notice")).to_contain_text("expirée")
                 await expect(panel.locator("#manual")).to_be_hidden()
                 await create()
                 code = await panel.locator("#code").text_content()
@@ -587,17 +592,17 @@ async def _test_browser(hass, profile, origin, admin, channel, component, direct
                     await expect(panel.locator("#approve")).to_be_disabled()
                     await panel.locator("#compared").check()
                     await panel.locator("#approve").click()
-                    await expect(panel.locator("#state")).to_contain_text("Approuvée")
+                    await expect(panel.locator("#state")).to_contain_text("En attente de confirmation sur Android")
                     pairing_id = reserved["pairing_id"]
                     headers = {"X-Horeveil-Authorization": f"v1 {pairing_id}.{_b64(secret)}"}
                     async with phone.post(
                         origin + _BASE + "/activate", json={"confirmed": True}, headers=headers,
                     ) as response:
                         assert (await response.json())["state"] == "active"
-                    await expect(panel.locator("#phones")).to_contain_text(pairing_id)
-                    page.once("dialog", lambda dialog: dialog.accept())
-                    await panel.locator("#phones button").click()
-                    await expect(panel.locator("#notice")).to_have_text("Accès révoqué.")
+                    await expect(panel.locator("#phones")).to_contain_text(pairing_id[:8])
+                    await panel.locator("#phones button.danger").click()
+                    await panel.locator("#confirm").click()
+                    await expect(panel.locator("#notice")).to_contain_text("a été révoqué")
                     async with phone.get(origin + _BASE + "/status", headers=headers) as response:
                         assert response.status == 401
             finally:
@@ -665,6 +670,223 @@ async def main(browser, channel, component, nginx):
             await hass.async_stop(force=True)
 
 
+
+@asynccontextmanager
+async def _panel_core(profile, origin, *, http_origin=None):
+    hass = HomeAssistant(str(profile))
+    loader.async_setup(hass)
+    port = int((http_origin or origin).rsplit(":", 1)[1])
+    http = {"server_host": ["127.0.0.1"], "server_port": port}
+    if http_origin is None:
+        http.update(ssl_certificate=str(profile / "serveur.pem"), ssl_key=str(profile / "serveur.key"))
+    network = {"internal_url": origin, "time_zone": "UTC"}
+    if http_origin is not None:
+        network["external_url"] = "https://outside.example.invalid:0"
+    config = {"homeassistant": network, "http": http, "frontend": {}, "config": {},
+              "lovelace": {}, "recorder": {}, _DOMAIN: {}}
+    try:
+        await Store(hass, 4, "onboarding", private=True).async_save({"done": list(STEPS)})
+        assert await bootstrap.async_from_config_dict(config, hass) is hass
+        await hass.async_start()
+        assert hass.http.server_port == port
+        # Fail early if this Core installation cannot load the services used at frontend startup.
+        from homeassistant.helpers.service import async_get_all_descriptions
+
+        await async_get_all_descriptions(hass)
+        yield hass
+    finally:
+        await hass.async_stop(force=True)
+
+
+async def _open_panel(context, origin, *, token=None, from_menu=False):
+    from playwright.async_api import expect
+
+    page = await context.new_page()
+    if token is not None:
+        await page.goto(origin + "/robots.txt")
+        await page.evaluate("(tokens) => localStorage.setItem('hassTokens', JSON.stringify(tokens))", {
+            **token, "clientId": origin + "/", "hassUrl": origin,
+            "expires": int(datetime.now(UTC).timestamp() * 1000) + 1_800_000,
+        })
+    await page.goto(origin + ("/profile/general" if from_menu else "/" + _PANEL))
+    if from_menu:
+        sidebar = page.locator("ha-sidebar")
+        menu = sidebar.locator(f'a[href="/{_PANEL}"]')
+        await expect(menu).to_be_visible(timeout=30_000)
+        await menu.click()
+    panel = page.locator(_PANEL)
+    await expect(panel.get_by_role("heading", name="Horéveil", exact=True, level=1)).to_be_visible(timeout=30_000)
+    await page.locator("#ha-launch-screen").wait_for(state="detached")
+    return page, panel
+
+
+async def _confirm_http_trial(client, origin, admin):
+    async with client.ws_connect(origin + "/api/websocket") as ws:
+        assert await _authenticate(ws, admin["access_token"]) == "auth_ok"
+        state = (await _ws(ws, "http/config"))["result"]
+        if state["active_config_type"] == "pending":
+            assert (await _ws(ws, "http/config/promote"))["success"]
+
+
+async def _signed_browser_phone(origin, panel, client):
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from playwright.async_api import expect
+
+    from qualify_native_transport import signed_phone
+    from real_pairing_native import check_request
+
+    base = origin + "/api/horeveil/direct/v1/"
+    secret = token_bytes(32)
+    claim = {"installation_id": str(uuid4()), "claim_id": str(uuid4()),
+             "phone_label": "Téléphone de recette", "credential_digest": _b64(sha256(secret).digest())}
+    code = await _browser_qr(panel, origin)
+    reply = await check_request(client, "POST", base + "claim", 200,
+                                headers={"X-Horeveil-Invitation": code}, json=claim)
+    assert reply["profile"] == "signed-v1"
+    pairing_id, server_id = reply["pairing_id"], reply["server_id"]
+    alias = ec.generate_private_key(ec.SECP256R1())
+    prepare = signed_phone(base, pairing_id, server_id, secret, alias)
+    public_key = alias.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    enrollment = {key: claim[key] for key in ("claim_id", "installation_id")}
+    enrollment.update(pairing_id=pairing_id, server_id=server_id, challenge=reply["challenge"],
+                      public_key_spki=_b64(public_key))
+    await check_request(client, "POST", base + "enroll", 200, **prepare("enroll", enrollment))
+    await expect(panel.locator("#review")).to_be_visible()
+    assert await panel.locator("#comparison").text_content() == _comparison(
+        reply, claim["claim_id"], secret, installation_id=claim["installation_id"], origin=origin, public_key=public_key,
+    )
+    await expect(panel.locator("#approve")).to_be_disabled()
+    await panel.locator("#compared").check()
+    await panel.locator("#approve").click()
+    await expect(panel.locator("#android-confirm")).to_be_visible()
+    assert (await check_request(client, "POST", base + "activate", 200,
+                                **prepare("activate", {"confirmed": True})))["state"] == "active"
+    await expect(panel.locator("#phones")).to_contain_text(pairing_id[:8])
+    return pairing_id, claim["installation_id"], prepare
+
+
+async def native_panel_smoke(channel, screenshots):
+    from playwright.async_api import async_playwright, expect
+
+    from real_pairing_native import check_request
+    from real_upgrade_030 import snapshot
+
+    if screenshots:
+        screenshots.mkdir(parents=True, exist_ok=True)
+
+    with TemporaryDirectory(prefix="horeveil-native-panel-") as directory:
+        profile = Path(directory)
+        copytree(_ROOT / "custom_components" / _DOMAIN, profile / "custom_components" / _DOMAIN)
+        _certificate_files(profile, None)
+        origin = f"https://127.0.0.1:{_free_port()}"
+        http_origin = f"http://127.0.0.1:{_free_port()}"
+        allowed = (origin + "/", http_origin + "/")
+        tls = ssl.create_default_context(cafile=profile / "ca.pem")
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(channel=channel, args=["--ignore-certificate-errors"])
+            context = await browser.new_context(viewport={"width": 1280, "height": 900}, color_scheme="light")
+            async def local_only(route):
+                if route.request.url.startswith(allowed):
+                    await route.continue_()
+                else:
+                    await route.abort()
+
+            await context.route("**/*", local_only)
+            try:
+                async with ClientSession(connector=TCPConnector(ssl=tls, resolver=ThreadedResolver())) as client:
+                    async with _panel_core(profile, origin) as hass:
+                        admin = await _token(hass, "Administrateur de recette", origin, administrator=True)
+                        await _confirm_http_trial(client, origin, admin)
+                        flow = await hass.config_entries.flow.async_init(_DOMAIN, context={"source": "user"})
+                        assert (await hass.config_entries.flow.async_configure(flow["flow_id"], {}))["type"] == "create_entry"
+                        await hass.async_block_till_done()
+                        entry, = hass.config_entries.async_entries(_DOMAIN)
+                        page, panel = await _open_panel(context, origin, token=admin, from_menu=True)
+                        await expect(panel.locator("#origin")).to_have_value(origin)
+                        await panel.locator("#create").click()
+                        await expect(panel.locator("#qr")).to_be_visible()
+                        await panel.locator("#cancel").click()
+                        await expect(panel.locator("#notice")).to_contain_text("Invitation annulée")
+                        await panel.locator("#create").click()
+                        await expect(panel.locator("#qr")).to_be_visible()
+                        registry = hass.data["horeveil.local_pairing_test"].registry
+                        with patch.object(registry, "_clock", lambda: monotonic() + 310):
+                            await expect(panel.locator("#notice")).to_contain_text("expirée")
+                        await expect(panel.locator("#qr")).to_be_hidden()
+                        await panel.locator("#create").click()
+                        await expect(panel.locator("#qr")).to_be_visible()
+                        pairing_id, installation_id, prepare = await _signed_browser_phone(origin, panel, client)
+                        await panel.get_by_role("button", name="Renommer", exact=False).click()
+                        await panel.locator("#phone-label").fill("Téléphone de recette")
+                        await panel.locator("#confirm").click()
+                        await expect(panel.get_by_role("heading", name="Téléphone de recette")).to_be_visible()
+                        await expect(panel.get_by_text("Source active · Webhook local", exact=True)).to_be_visible()
+                        await panel.locator("#calendar-entries select").select_option(pairing_id)
+                        await panel.locator("#calendar-entries button").click()
+                        await panel.locator("#confirm").click()
+                        await expect(panel.get_by_text(
+                            "Source active · Téléphone de recette · HTTPS direct", exact=True,
+                        )).to_be_visible()
+                        assert str(entry.runtime_data.direct_source) == pairing_id
+                        body = snapshot() | {"installation_id": installation_id}
+                        calendar = origin + "/api/horeveil/direct/v1/calendar"
+                        assert (await check_request(client, "POST", calendar, 200,
+                                                    **prepare("calendar", body)))["result"] == "accepted"
+                        await page.close()
+                    print("Frontend Core : menu, QR, annulation, expiration, deux confirmations et choix de source.", flush=True)
+
+                    async with _panel_core(profile, origin) as restarted:
+                        await restarted.async_block_till_done()
+                        entry, = restarted.config_entries.async_entries(_DOMAIN)
+                        assert str(entry.runtime_data.direct_source) == pairing_id
+                        page, panel = await _open_panel(context, origin)
+                        await expect(panel.get_by_role("heading", name="Téléphone de recette")).to_be_visible()
+                        await expect(panel.locator("#phones")).to_contain_text("Dernière réception du calendrier")
+                        bg = await panel.evaluate("(panel) => getComputedStyle(panel).backgroundColor")
+                        if screenshots:
+                            await page.screenshot(path=screenshots / "core-clair.png")
+                        await page.emulate_media(color_scheme="dark")
+                        await expect(panel).not_to_have_css("background-color", bg)
+                        if screenshots:
+                            await page.screenshot(path=screenshots / "core-sombre.png")
+                        await page.set_viewport_size({"width": 390, "height": 844})
+                        await page.emulate_media(color_scheme="light")
+                        await expect(panel).to_have_css("background-color", bg)
+                        await expect(panel.locator("#content")).to_have_css("grid-template-columns", re.compile(r"^\d+(\.\d+)?px$"))
+                        await expect(panel.locator("ha-menu-button").get_by_role("button")).to_be_visible()
+                        if screenshots:
+                            await page.screenshot(path=screenshots / "core-mobile.png", full_page=True)
+                        await panel.get_by_role("button", name="Révoquer", exact=False).click()
+                        await panel.locator("#confirm").click()
+                        await expect(panel.locator("#notice")).to_contain_text("a été révoqué")
+                        assert entry.runtime_data.current is None
+                        await check_request(client, "POST", calendar, 401, **prepare("calendar", body))
+                        await page.close()
+                    print("Redémarrage Core : renommage, source et réception persistés. Révocation et refus signé vérifiés.", flush=True)
+
+                    # A fresh profile lets Core migrate the HTTP settings independently of the TLS trial.
+                    plain_profile = profile / "plaintext"
+                    copytree(_ROOT / "custom_components" / _DOMAIN, plain_profile / "custom_components" / _DOMAIN)
+                    async with _panel_core(plain_profile, origin, http_origin=http_origin) as hass:
+                        http_admin = await _token(hass, "Administrateur de recette", http_origin, administrator=True)
+                        await _confirm_http_trial(client, http_origin, http_admin)
+                        http_context = await browser.new_context(viewport={"width": 1280, "height": 900})
+                        await http_context.route("**/*", local_only)
+                        page, panel = await _open_panel(http_context, http_origin, token=http_admin)
+                        await expect(panel.locator("#network")).to_be_visible()
+                        await expect(panel.locator("#https-link")).to_have_attribute("href", origin + "/" + _PANEL)
+                        await expect(panel.locator("#create")).to_be_hidden()
+                        async with client.ws_connect(http_origin + "/api/websocket") as ws:
+                            assert await _authenticate(ws, http_admin["access_token"]) == "auth_ok"
+                            assert (await _pair(ws, "info"))["error"]["code"] == "unauthorized"
+                        if screenshots:
+                            await page.screenshot(path=screenshots / "core-http.png")
+                        await http_context.close()
+                    print("HTTP natif : lien HTTPS validé et commandes d’association refusées.", flush=True)
+            finally:
+                await browser.close()
+
+
 if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--browser", action="store_true", help="Exercise the installed HA frontend with Playwright.")
@@ -674,7 +896,12 @@ if __name__ == "__main__":
         "--component", action="store_true",
         help="Mount the real component in the authenticated frontend without testing its router.",
     )
+    parser.add_argument("--native-panel", action="store_true", help="Exercise the standard signed panel and restart Core.")
+    parser.add_argument("--screenshots", type=Path, help="Capture the native panel without invitation data.")
     arguments = parser.parse_args()
     if arguments.component and not arguments.browser:
         parser.error("--component requires --browser")
-    asyncio.run(main(arguments.browser, arguments.channel, arguments.component, arguments.nginx))
+    if arguments.native_panel:
+        asyncio.run(native_panel_smoke(arguments.channel, arguments.screenshots))
+    else:
+        asyncio.run(main(arguments.browser, arguments.channel, arguments.component, arguments.nginx))

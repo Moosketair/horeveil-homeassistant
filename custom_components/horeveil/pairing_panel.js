@@ -84,7 +84,7 @@ const template = `
     <p id="notice" role="status">Chargement du panneau…</p>
     <button id="retry" type="button" hidden>Réessayer</button>
     <div id="content" hidden>
-      <section aria-labelledby="phones-title">
+      <section id="phones-card" aria-labelledby="phones-title">
         <div class="heading"><ha-icon icon="mdi:cellphone" aria-hidden="true"></ha-icon><h2 id="phones-title">Téléphones associés</h2></div>
         <p id="empty">Aucun téléphone associé.</p>
         <ul id="phones" hidden></ul>
@@ -224,6 +224,10 @@ class HoreveilAssociation extends HTMLElement {
   #httpsOrigins;
   #configuredOrigin;
   #loaded = false;
+  #stale = false;
+  #panelOrigin;
+  #mutation;
+  #interruptedMutation;
   #polling;
   #dialogAction;
   #invitation;
@@ -274,15 +278,26 @@ class HoreveilAssociation extends HTMLElement {
     this.toggleAttribute("narrow", Boolean(value));
   }
 
+  set panel(value) {
+    this.#panelOrigin = value?.config?.https_origin;
+    this.#network(Boolean(this.#admin));
+  }
+
   set hass(value) {
     this.#hass = value;
     const user = value?.user;
     const admin = user?.is_admin && value.connected !== false ? user.id : undefined;
     this.#network(Boolean(admin));
     if (admin !== this.#admin) {
+      if (!admin && user?.is_admin && this.#mutation?.admin === user.id) {
+        this.#interruptedMutation = this.#mutation;
+      } else if (this.#interruptedMutation?.admin !== admin) {
+        this.#interruptedMutation = undefined;
+      }
       this.#reset();
       this.#admin = admin;
       if (this.isConnected && admin && location.protocol === "https:") this.#refresh();
+      else if (this.#interruptedMutation) this.#notice(this.#interruptedMutation.message, "error");
     }
   }
 
@@ -295,6 +310,7 @@ class HoreveilAssociation extends HTMLElement {
 
   disconnectedCallback() {
     clearInterval(this.#timer);
+    this.#interruptedMutation = undefined;
     this.#reset();
   }
 
@@ -310,9 +326,7 @@ class HoreveilAssociation extends HTMLElement {
 
   #network(admin) {
     const insecure = location.protocol !== "https:";
-    const config = this.#hass?.config;
-    const origin = admin && insecure && [config?.external_url, config?.internal_url]
-      .map((value) => parseOrigin(value ?? "")).find(Boolean);
+    const origin = admin && insecure && this.#panelOrigin;
     const link = this.#element("https-link");
     if (origin) link.href = new URL("/horeveil-association", origin).href;
     else link.removeAttribute("href");
@@ -322,9 +336,17 @@ class HoreveilAssociation extends HTMLElement {
   }
 
   #refresh() {
-    if (!this.#loaded) this.#notice("Chargement du panneau…");
-    this.#run((generation) => this.#load(generation),
-      "Impossible de charger le panneau. Vérifiez votre session puis réessayez.");
+    const interrupted = this.#interruptedMutation;
+    if (!this.#loaded && !interrupted) this.#notice("Chargement du panneau…");
+    this.#run(async (generation) => {
+      await this.#load(generation);
+      if (generation === this.#generation && interrupted) {
+        this.#notice(`${interrupted.message} Le panneau a été actualisé.`);
+        this.#interruptedMutation = undefined;
+      }
+    }, interrupted ? `${interrupted.message} L’actualisation du panneau a échoué. Réessayez.`
+      : this.#stale ? "L’actualisation du panneau a échoué. Réessayez."
+        : "Impossible de charger le panneau. Vérifiez votre session puis réessayez.");
   }
 
   #reset() {
@@ -337,6 +359,8 @@ class HoreveilAssociation extends HTMLElement {
     this.#element("https-origins").replaceChildren();
     this.#configuredOrigin = undefined;
     this.#loaded = false;
+    this.#stale = false;
+    this.#mutation = undefined;
     this.#element("phones").inert = false;
     this.#element("calendar-entries").inert = false;
     this.#polling = undefined;
@@ -384,15 +408,54 @@ class HoreveilAssociation extends HTMLElement {
       } else {
         this.#notice(fallback, "error");
       }
-      this.#element("retry").hidden = this.#loaded;
+      this.#element("retry").hidden = this.#loaded && !this.#stale;
     } finally {
       if (generation === this.#generation) {
         this.#busy = false;
         this.#element("phones").inert = false;
         this.#element("calendar-entries").inert = false;
+        if (this.#stale) this.#element("retry").hidden = false;
         this.#invitationState();
       }
     }
+  }
+
+  #markStale(message) {
+    this.#stale = true;
+    this.#element("phones-card").hidden = true;
+    this.#element("calendar-sources").hidden = true;
+    this.#element("retry").hidden = false;
+    this.#notice(message, "error");
+  }
+
+  #mutate(command, fields, { success, rejected, failure, unknown }) {
+    this.#run(async (generation) => {
+      const mutation = { admin: this.#admin, message: unknown };
+      this.#mutation = mutation;
+      try {
+        try {
+          await this.#call(command, fields);
+        } catch (error) {
+          if (generation !== this.#generation) return;
+          if (error?.code === "unauthorized") throw error;
+          if (!rejected.includes(error?.code)) this.#markStale(`${unknown} Actualisez le panneau.`);
+          else if (error.code === "phone_unavailable") this.#markStale(`${failure} Actualisez le panneau.`);
+          else this.#notice(failure, "error");
+          return;
+        }
+        if (generation !== this.#generation) return;
+        mutation.message = `${success}, mais l’actualisation de l’affichage a échoué.`;
+        try {
+          await this.#load(generation);
+        } catch {
+          if (generation === this.#generation) this.#markStale(`${mutation.message} Actualisez le panneau.`);
+          return;
+        }
+        if (generation === this.#generation) this.#notice(`${success}.`, "success");
+      } finally {
+        if (this.#mutation === mutation) this.#mutation = undefined;
+      }
+    });
   }
 
   #address() {
@@ -501,12 +564,14 @@ class HoreveilAssociation extends HTMLElement {
           title: "Changer la source du calendrier",
           description: `Le calendrier « ${entry.title} » utilisera ${choices.get(next)}. La projection actuelle sera effacée jusqu’à la prochaine réception.`,
           button: "Changer la source",
-          action: () => this.#run(async (generation) => {
-            await this.#call("calendar_source", { entry_id: entry.entry_id, pairing_id: next || null, confirmed: true });
-            if (generation !== this.#generation) return;
-            await this.#load(generation);
-            if (generation === this.#generation) this.#notice("Source du calendrier mise à jour.", "success");
-          }, "Impossible de changer la source du calendrier. Actualisez la liste puis réessayez."),
+          action: () => this.#mutate("calendar_source", {
+            entry_id: entry.entry_id, pairing_id: next || null, confirmed: true,
+          }, {
+            success: "La source du calendrier a été modifiée",
+            rejected: ["calendar_source_unavailable"],
+            failure: "Home Assistant a refusé le changement de source du calendrier.",
+            unknown: "Le résultat du changement de source du calendrier est indéterminé.",
+          }),
         });
       });
       save.disabled = true;
@@ -521,6 +586,8 @@ class HoreveilAssociation extends HTMLElement {
       row.append(title, current, last, label, actions);
       return row;
     }));
+    this.#stale = false;
+    this.#element("phones-card").hidden = false;
     this.#notice("");
     return info.phones;
   }
@@ -548,12 +615,12 @@ class HoreveilAssociation extends HTMLElement {
       description: "Le libellé est enregistré dans Home Assistant. Laissez le champ vide pour rétablir le nom généré.",
       button: "Enregistrer",
       label,
-      action: (value) => this.#run(async (generation) => {
-        await this.#call("rename", { pairing_id: id, label: value });
-        if (generation !== this.#generation) return;
-        await this.#load(generation);
-        if (generation === this.#generation) this.#notice("Libellé du téléphone enregistré.", "success");
-      }, "Impossible d’enregistrer le libellé. Utilisez au maximum 64 caractères imprimables."),
+      action: (value) => this.#mutate("rename", { pairing_id: id, label: value }, {
+        success: "Le libellé du téléphone a été enregistré",
+        rejected: ["invalid_label", "phone_unavailable", "rename_unavailable"],
+        failure: "Home Assistant a refusé le renommage. Vérifiez le téléphone et le libellé (64 caractères maximum).",
+        unknown: "Le résultat du renommage est indéterminé.",
+      }),
     });
   }
 
@@ -691,7 +758,7 @@ class HoreveilAssociation extends HTMLElement {
       this.#element("code").textContent = "";
       this.#element("comparison").textContent = comparison;
       this.#element("compared").checked = false;
-      this.#notice("");
+      if (!this.#stale) this.#notice("");
       this.#invitationState();
     } catch (error) {
       if (!current()) return;
@@ -740,12 +807,12 @@ class HoreveilAssociation extends HTMLElement {
       description: "Le téléphone perdra son accès et les données de calendrier reçues de ce téléphone seront retirées. Pour le reconnecter, vous devrez refaire l’association.",
       button: "Révoquer le téléphone",
       destructive: true,
-      action: () => this.#run(async (generation) => {
-        await this.#call("revoke", { pairing_id: id, confirmed: true });
-        if (generation !== this.#generation) return;
-        await this.#load(generation);
-        if (generation === this.#generation) this.#notice("Accès du téléphone révoqué.", "success");
-      }, "Impossible de confirmer la révocation. Actualisez la liste pour vérifier l’état du téléphone."),
+      action: () => this.#mutate("revoke", { pairing_id: id, confirmed: true }, {
+        success: "L’accès du téléphone a été révoqué",
+        rejected: ["confirmation_required", "phone_unavailable"],
+        failure: "Home Assistant a refusé la révocation du téléphone.",
+        unknown: "Le résultat de la révocation est indéterminé.",
+      }),
     });
   }
 }

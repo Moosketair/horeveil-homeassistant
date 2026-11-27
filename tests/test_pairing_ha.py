@@ -260,6 +260,107 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results, ["unauthorized"])
         self.assertFalse((self.directory / "horeveil.pairing_labels").exists())
 
+    async def test_panel_publishes_only_a_server_validated_https_origin(self):
+        for external, internal, expected in (
+            ("https://outside.example:443/", "https://inside.example", "https://outside.example"),
+            ("https://outside.example:0", "https://inside.example:8443", "https://inside.example:8443"),
+            ("https://outside.example:0", "http://inside.example", None),
+            ("https://user:secret@outside.example", "https://inside.example/path?token=sample", None),
+            (None, None, None),
+        ):
+            with self.subTest(expected=expected):
+                hass = self.new_ha()
+                hass.config.external_url = external
+                hass.config.internal_url = internal
+                await setup_domain(hass, {})
+                panel = hass.panels["horeveil-association"]
+                self.assertTrue(panel["require_admin"])
+                self.assertEqual(panel["config"], {"https_origin": expected})
+
+    async def test_rename_and_revoke_serialize_and_recover_label_cleanup(self):
+        await self.start()
+        runtime = self.hass.data["horeveil.local_pairing_test"]
+
+        class ObservableLock(asyncio.Lock):
+            def __init__(self):
+                super().__init__()
+                self.contended = asyncio.Event()
+
+            async def acquire(self):
+                if self.locked():
+                    self.contended.set()
+                return await super().acquire()
+
+        lock = runtime.labels_lock = ObservableLock()
+
+        async def phone():
+            invite = await runtime.registry.async_invite(administrator_id=self.admin.id, confirmed_origin=_ORIGIN)
+            result = await runtime.registry.async_activate_confirmed(
+                invite.invitation_id, invite.code, installation_id=uuid4(),
+                credential_digest=sha256(self.secret).digest(), administrator_id=self.admin.id,
+            )
+            return str(result.pairing_id)
+
+        pairing_id = await phone()
+        entered, release = asyncio.Event(), asyncio.Event()
+        save = runtime.labels.async_save
+
+        async def delayed_save(labels):
+            if labels:
+                entered.set()
+                await release.wait()
+            await save(labels)
+
+        with patch.object(runtime.labels, "async_save", delayed_save):
+            rename = asyncio.create_task(self.ws("rename", pairing_id=pairing_id, label="Recette"))
+            async with asyncio.timeout(5):
+                await entered.wait()
+            revoke = asyncio.create_task(self.ws("revoke", pairing_id=pairing_id, confirmed=True))
+            try:
+                async with asyncio.timeout(5):
+                    await lock.contended.wait()
+                self.assertFalse(revoke.done())
+            finally:
+                release.set()
+                renamed, revoked = await asyncio.gather(rename, revoke)
+        self.assertEqual(renamed["result"]["state"], "renamed")
+        self.assertEqual(revoked["result"]["state"], "revoked")
+        self.assertEqual(await runtime.labels.async_load(), {})
+
+        pairing_id = await phone()
+        self.assertIn("result", await self.ws("rename", pairing_id=pairing_id, label="Premier libellé"))
+        runtime.labels.fail = True
+        entered.clear()
+        release.clear()
+        lock.contended.clear()
+        revoke_phone = runtime.registry.async_revoke
+
+        async def delayed_revoke(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await revoke_phone(*args, **kwargs)
+
+        with patch.object(runtime.registry, "async_revoke", delayed_revoke):
+            revoke = asyncio.create_task(self.ws("revoke", pairing_id=pairing_id, confirmed=True))
+            async with asyncio.timeout(5):
+                await entered.wait()
+            rename = asyncio.create_task(self.ws("rename", pairing_id=pairing_id, label="Second libellé"))
+            try:
+                async with asyncio.timeout(5):
+                    await lock.contended.wait()
+            finally:
+                release.set()
+                with self.assertLogs(pairing_ha_module.__name__, level="WARNING"):
+                    revoked, renamed = await asyncio.gather(revoke, rename)
+        self.assertEqual(revoked["result"]["state"], "revoked")
+        self.assertEqual(renamed["error"], "phone_unavailable")
+        self.assertEqual(await runtime.labels.async_load(), {pairing_id: "Premier libellé"})
+        restarted = self.new_ha()
+        await setup_domain(restarted, self.config())
+        runtime = restarted.data["horeveil.local_pairing_test"]
+        self.assertEqual(await runtime.labels.async_load(), {})
+        self.assertEqual(await runtime.registry.async_list_active(), ())
+
     async def test_admin_certificate_approval_and_durable_activation(self):
         await self.start()
         self.user = None

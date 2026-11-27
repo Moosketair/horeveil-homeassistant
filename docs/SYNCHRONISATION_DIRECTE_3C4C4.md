@@ -125,3 +125,74 @@ composant frontend interne. La mise en page passe sur une colonne en vue étroit
    codes, approuver dans HA puis confirmer sur Android. Essayer aussi
    l’expiration et l’annulation d’une autre invitation. Révoquer uniquement le
    téléphone de recette et vérifier que ses envois directs sont refusés.
+
+## Étape 3C4C.6.1 — Réserves du contre-audit de `842fc2f`
+
+Le contre-audit avait constaté trois défauts de concurrence et d’affichage.
+Il avait confirmé les contrôles d’accès et le caractère définitif de la
+révocation. La correction réutilise ces mécanismes.
+
+- Le renommage et la révocation prennent le verrou du Store de libellés dans
+  le même ordre. Si le renommage s’achève en premier, la révocation efface le
+  libellé. Si la révocation s’achève en premier, le renommage est refusé.
+  Une panne du Store des libellés permet toujours de révoquer le téléphone.
+  Le démarrage suivant réconcilie le Store avec le registre dès que l’écriture
+  est de nouveau possible.
+- Core valide l’origine HTTPS du lien du panneau lors de son enregistrement.
+  Il examine les URL externe puis interne. Un port 0, des identifiants ou un
+  chemin supplémentaire rendent une URL inadmissible. Le navigateur n’ajoute
+  que le chemin fixe du panneau. Après un changement d’adresse réseau,
+  redémarrer Core pour recalculer ce lien.
+- Le panneau distingue un refus explicite, une opération confirmée suivie
+  d’un échec d’actualisation et une réponse perdue. Il retire les informations
+  concernées tant qu’elles sont périmées. Le bouton **Réessayer** relit
+  l’état sans répéter le changement, le renommage ni la révocation.
+
+### Recettes ciblées
+
+- `python -m unittest discover -s tests -p 'test_pairing*.py'` vérifie les
+  deux ordres de concurrence avec des barrières, la reprise après échec de
+  nettoyage et les origines HTTPS validées à l’enregistrement du panneau.
+- `python tests/panel_mutation_browser.py --channel chrome` rejoue les
+  trois résultats d’un changement de source, y compris une déconnexion,
+  ainsi que l’actualisation après renommage et révocation.
+- Avec l’environnement Python 3.14 de Core et Playwright,
+  `python tests/real_pairing_smoke.py --native-panel --channel chrome`
+  utilise un profil jetable, la boucle locale, des certificats de test et un
+  client signé synthétique. L’option `--screenshots <dossier>` enregistre les
+  vues après l’association, hors du parcours de saisie des codes.
+
+Les 40 tests Python ciblés et la recette Playwright avec API simulée ont
+réussi. Le trajet signé a aussi été exécuté sur Core 2026.11.2, avec
+validation du webhook local. Dans le frontend réel 20261028.6 sur Chrome,
+le menu ouvre Horéveil. La recette HTTPS valide l’annulation, l’expiration,
+le QR décodé par ZXing et accepté par le parseur Kotlin de recette, les deux
+confirmations et le choix de la source. Le libellé, la source et l’heure de
+réception persistent après l’arrêt et le redémarrage de Core sur le même
+profil. Après révocation, le client signé reçoit un refus HTTP 401.
+Les captures du frontend réel couvrent les thèmes clair et sombre et une
+vue mobile de 390 px. Sur le profil HTTP séparé, le panneau ignore l’URL
+externe configurée au port 0, propose l’origine HTTPS interne et les
+commandes d’association sont refusées par Core en HTTP.
+
+Sous Windows, les deux bibliothèques audio requises au démarrage du frontend
+ont été compilées dans le banc. Core et ses commandes d’administration sont
+exercés avec leurs implémentations réelles. Le scan par la caméra Android
+reste à vérifier en recette utilisateur.
+
+Les métadonnées locales et la structure distribuée par HACS sont valides.
+Hassfest retourne zéro intégration invalide et actionlint valide le workflow.
+La validation du téléchargement HACS de la bêta dépend de sa publication
+ultérieure.
+
+### Notes de version 0.4.0-beta.2
+
+- Panneau adapté aux thèmes Home Assistant et à l’affichage mobile. Il affiche
+  les téléphones associés, leur libellé personnalisé et la dernière réception
+  du calendrier lorsque celle-ci est disponible.
+- Parcours d’association guidé jusqu’à la confirmation Android. En HTTP, le
+  panneau utilise une origine HTTPS validée par Core ou indique où configurer
+  l’accès sécurisé.
+- Renommage et révocation coordonnés. Le panneau distingue les résultats
+  confirmés de ceux qui nécessitent une actualisation. La source du calendrier
+  reste configurable entre webhook local et téléphone HTTPS.

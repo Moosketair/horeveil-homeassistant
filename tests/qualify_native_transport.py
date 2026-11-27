@@ -44,7 +44,7 @@ async def register_probe(hass, origin):
         # Core processes forwarding before dispatch. IP only partitions the rate budget.
         return ip_address(request.remote) if request.remote else None
 
-    runtime = Runtime(registry, None, hass.http.server_port, local_test=False, proxy=None)
+    runtime = Runtime(hass, registry, None, hass.http.server_port, local_test=False, proxy=None)
     runtime.configured_origin = runtime.origin = origin
     runtime.http = pairing_http.PairingHttp(registry, origin=origin, local_source=rate_source)
     hass.data[ha._RUNTIME_KEY] = runtime
@@ -111,17 +111,32 @@ async def exercise(client, origin, admin, guest, registry, through_proxy):
         await check_request(client, "GET", status, 401, headers=auth)
 
 
-async def exercise_signed(client, origin, admin, guest, entry, backend):
+def signed_phone(base, pairing_id, server_id, secret, alias):
     from http_message_signatures import HTTPMessageSigner, HTTPSignatureKeyResolver, algorithms
-
-    base = origin + "/api/horeveil/direct/v1/"
-    alias = ec.generate_private_key(ec.SECP256R1())
 
     class Key(HTTPSignatureKeyResolver):
         def resolve_private_key(self, key_id):
             return alias
 
     signer = HTTPMessageSigner(signature_algorithm=algorithms.ECDSA_P256_SHA256, key_resolver=Key())
+
+    def prepare(operation, body):
+        raw = json.dumps(body, separators=(",", ":")).encode()
+        message = SimpleNamespace(method="POST", url=base + operation, headers={
+            "Content-Type": "application/json", "Horeveil-Server-Id": server_id,
+            "X-Horeveil-Authorization": f"v1 {pairing_id}.{_b64(secret)}",
+        })
+        now = datetime.now(UTC)
+        signer.sign(message, key_id=pairing_id, created=now, expires=now + timedelta(seconds=120),
+                    nonce=str(uuid4()), label="sig1", tag=f"horeveil-{operation}-v1", body=raw,
+                    covered_component_ids=("@method", "@target-uri", "content-type", "content-digest", "horeveil-server-id"))
+        return {"data": raw, "headers": message.headers}
+    return prepare
+
+
+async def exercise_signed(client, origin, admin, guest, entry, backend):
+    base = origin + "/api/horeveil/direct/v1/"
+    alias = ec.generate_private_key(ec.SECP256R1())
     await check_request(client, "POST", base + "status", 401, headers={"X-Horeveil-Relay-Secret": "invalid"})
     await check_request(client, "POST", origin + _BASE + "/claim", 404)
     async with client.ws_connect(origin + "/api/websocket") as ws:
@@ -145,18 +160,7 @@ async def exercise_signed(client, origin, admin, guest, entry, backend):
         approval = {"invitation_id": invite["invitation_id"], "pairing_id": pairing_id, "confirmed": True}
         assert not (await _pair(ws, "approve", **approval))["success"]
 
-        def prepare(operation, body):
-            raw = json.dumps(body, separators=(",", ":")).encode()
-            message = SimpleNamespace(method="POST", url=base + operation, headers={
-                "Content-Type": "application/json", "Horeveil-Server-Id": server_id,
-                "X-Horeveil-Authorization": f"v1 {pairing_id}.{_b64(secret)}",
-            })
-            now = datetime.now(UTC)
-            signer.sign(message, key_id=pairing_id, created=now, expires=now + timedelta(seconds=120),
-                        nonce=str(uuid4()), label="sig1", tag=f"horeveil-{operation}-v1", body=raw,
-                        covered_component_ids=("@method", "@target-uri", "content-type", "content-digest", "horeveil-server-id"))
-            return {"data": raw, "headers": message.headers}
-
+        prepare = signed_phone(base, pairing_id, server_id, secret, alias)
         enrollment = {key: claim[key] for key in ("claim_id", "installation_id")}
         enrollment.update(pairing_id=pairing_id, server_id=server_id, challenge=reply["challenge"], public_key_spki=_b64(
             alias.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)))
