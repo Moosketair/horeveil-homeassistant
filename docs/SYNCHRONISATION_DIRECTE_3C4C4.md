@@ -196,3 +196,33 @@ ultérieure.
 - Renommage et révocation coordonnés. Le panneau distingue les résultats
   confirmés de ceux qui nécessitent une actualisation. La source du calendrier
   reste configurable entre webhook local et téléphone HTTPS.
+
+## Étape 3C4C.6.2 — Résultat indéterminé après une écriture
+
+Sur `86b88d7`, deux sondes ont fait réussir l’écriture sur disque puis échouer
+sa relecture de contrôle. La source et le libellé écrits ont été retrouvés
+après restauration. Les commandes avaient pourtant renvoyé
+`calendar_source_unavailable` et `rename_unavailable`. Chrome affichait
+alors un refus et conservait les anciennes valeurs.
+
+- `storage_outcome_unknown` signale désormais une écriture dont le résultat
+  persistant est invérifiable. Les refus établis gardent leurs codes. Le
+  changement de source confirmé retourne `selected` et le renommage confirmé
+  `renamed`. La révocation conserve son traitement de `registry_unavailable`.
+- Le panneau masque les données potentiellement périmées et propose
+  **Réessayer**. Cette action appelle seulement `info`. Un libellé
+  temporairement illisible est signalé comme indisponible jusqu’à une lecture
+  réussie. Pour une source incertaine, le récepteur bloque les écritures et
+  l’entrée doit être rechargée ou Core redémarré. Une actualisation affiche
+  ensuite la source restaurée depuis le Store.
+- Les sondes permanentes vérifient la réponse WebSocket, la persistance et
+  l’absence d’écriture lors de la relecture. Six scénarios Chrome avec API
+  simulée couvrent le succès, le refus, l’échec d’actualisation, la perte de
+  réponse, la déconnexion et le résultat indéterminé sur stockage, y compris
+  la cohérence du message de révocation.
+
+Sous Windows, les 42 tests Python ciblés sur l’association et les 30 tests du
+récepteur ont réussi avec Python 3.13. Les six scénarios Playwright et le
+contrôle de syntaxe JavaScript ont réussi. La recette Core réelle de 3C4C.6.1
+reste la référence pour les parcours ordinaires. Le lot est remis pour
+contre-vérification des deux sondes ciblées.

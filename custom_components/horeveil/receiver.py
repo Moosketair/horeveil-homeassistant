@@ -54,6 +54,7 @@ class SnapshotReceiver:
         self.received_at: datetime | None = None
         self._closed = False
         self._storage_uncertain = False
+        self.source_selection_uncertain = False
         self.direct_source: UUID | None = None
         self._direct_watermarks: dict[str, int] = {}
 
@@ -126,6 +127,8 @@ class SnapshotReceiver:
                     raise OSError
             except Exception:
                 self._storage_uncertain = True
+                if forget is None:
+                    self.source_selection_uncertain = True
                 if forget is not None and forget == self.direct_source:
                     self._hide_snapshot()
                 return False

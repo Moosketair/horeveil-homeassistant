@@ -5,6 +5,7 @@ from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from ipaddress import IPv4Address
+import json
 from pathlib import Path
 from secrets import token_bytes
 import ssl
@@ -21,7 +22,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from test_pairing_protocol import comparison_code
-from test_receiver import current_request, is_cloud_request, pairing_ha_module, pairing_signed_module, setup_domain
+from test_receiver import (
+    DiskStore, EXAMPLE, current_request, is_cloud_request, pairing_ha_module, pairing_signed_module,
+    receiver_module, setup_domain,
+)
 
 _BASE = "/api/horeveil/v1/pair"
 _ORIGIN = "https://127.0.0.1:8123"
@@ -130,9 +134,9 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
     def config(self):
         return {"horeveil": {"local_pairing_test_client_sha256": self.fingerprint}}
 
-    async def start(self):
+    async def start(self, *, universal=False):
         self.hass = self.new_ha()
-        await setup_domain(self.hass, self.config())
+        await setup_domain(self.hass, {} if universal else self.config())
         app = web.Application()
 
         async def dispatch_ws(request):
@@ -259,6 +263,84 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
             current_request.reset(token)
         self.assertEqual(results, ["unauthorized"])
         self.assertFalse((self.directory / "horeveil.pairing_labels").exists())
+
+    async def test_calendar_source_write_succeeds_before_readback_fails(self):
+        await self.start(universal=True)
+        hass = self.hass
+        hass.is_stopping = False
+        hass.async_add_executor_job = asyncio.to_thread
+        entry = SimpleNamespace(entry_id="recette", title="Calendrier de recette")
+        hass.config_entries = SimpleNamespace(async_entries=lambda _domain: [entry])
+        store = DiskStore(hass, 1, "calendar")
+        source = uuid4()
+        await store.async_save({
+            "snapshot": json.dumps(EXAMPLE), "direct_source": str(source),
+            "received_at": EXAMPLE["generated_at"],
+        })
+        receiver = receiver_module.SnapshotReceiver(hass, store, "recette", entry.entry_id)
+        await receiver.async_restore()
+        receivers = hass.data[pairing_ha_module.CALENDAR_RECEIVERS] = {entry.entry_id: receiver}
+        fields = {"entry_id": entry.entry_id, "pairing_id": None}
+        self.user = SimpleNamespace(id="other", is_active=True, is_admin=False)
+        self.assertEqual(await self.ws("calendar_source", **fields, confirmed=True), {"error": "unauthorized"})
+        self.user = self.admin
+        self.assertEqual(await self.ws("calendar_source", **fields, confirmed=False),
+                         {"error": "calendar_source_unavailable"})
+        with patch.object(store, "async_load", side_effect=OSError):
+            response = await self.ws("calendar_source", **fields, confirmed=True)
+        self.assertEqual(receiver.direct_source, source)
+        self.assertIsNotNone(receiver.received_at)
+        self.assertEqual(store.writes, 2)
+        with patch.object(pairing_ha_module, "_https_origins", return_value=[]):
+            stale = (await self.ws("info"))["result"]["calendars"][0]
+            restarted_store = DiskStore(hass, 1, "calendar")
+            restored = receiver_module.SnapshotReceiver(hass, restarted_store, "recette", entry.entry_id)
+            await restored.async_restore()
+            receivers[entry.entry_id] = restored
+            recovered = (await self.ws("info"))["result"]["calendars"][0]
+        self.assertIsNone(restored.direct_source)
+        self.assertIsNone(restored.current)
+        self.assertIsNone((await restarted_store.async_load())["snapshot"])
+        self.assertEqual(restarted_store.writes, 0)
+        self.assertEqual(response, {"error": "storage_outcome_unknown"})
+        self.assertTrue(stale["source_uncertain"])
+        self.assertIsNone(stale["pairing_id"])
+        self.assertIsNone(stale["last_success"])
+        self.assertIsNone(recovered["pairing_id"])
+        self.assertFalse(recovered.get("source_uncertain", False))
+        self.assertEqual(await self.ws("calendar_source", **fields, confirmed=True),
+                         {"result": {"state": "selected"}})
+        self.assertEqual(restarted_store.writes, 0)
+
+    async def test_rename_write_succeeds_before_readback_fails(self):
+        await self.start()
+        runtime = self.hass.data["horeveil.local_pairing_test"]
+        invite = await runtime.registry.async_invite(administrator_id=self.admin.id, confirmed_origin=_ORIGIN)
+        association = await runtime.registry.async_activate_confirmed(
+            invite.invitation_id, invite.code, installation_id=uuid4(),
+            credential_digest=sha256(self.secret).digest(), administrator_id=self.admin.id,
+        )
+        pairing_id = str(association.pairing_id)
+        fields = {"pairing_id": pairing_id, "label": "Chambre"}
+        load = runtime.labels.async_load
+
+        async def fail_after_write():
+            if runtime.labels.writes:
+                raise OSError
+            return await load()
+
+        with patch.object(runtime.labels, "async_load", side_effect=fail_after_write):
+            response = await self.ws("rename", **fields)
+            unavailable = (await self.ws("info"))["result"]
+        self.assertEqual((await self.ws("info"))["result"]["phone_labels"], {pairing_id: "Chambre"})
+        self.assertEqual(runtime.labels.writes, 1)
+        restarted = self.new_ha()
+        await setup_domain(restarted, self.config())
+        self.hass = restarted
+        self.assertEqual((await self.ws("info"))["result"]["phone_labels"], {pairing_id: "Chambre"})
+        self.assertEqual(restarted.data["horeveil.local_pairing_test"].labels.writes, 0)
+        self.assertEqual(response, {"error": "storage_outcome_unknown"})
+        self.assertIsNone(unavailable["phone_labels"])
 
     async def test_panel_publishes_only_a_server_validated_https_origin(self):
         for external, internal, expected in (
@@ -515,6 +597,12 @@ class NativePairingTests(unittest.IsolatedAsyncioTestCase):
             (await self.ws("rename", pairing_id=pairing_id, label="test\nlabel"))["error"], "invalid_label",
         )
         labels = self.hass.data["horeveil.local_pairing_test"].labels
+        labels.fail = True
+        self.assertEqual(
+            (await self.ws("rename", pairing_id=pairing_id, label="Essai"))["error"], "storage_outcome_unknown",
+        )
+        labels.fail = False
+        await labels.async_save({})
         labels.fail = True
         self.assertEqual(
             (await self.ws("rename", pairing_id=pairing_id, label="Essai"))["error"], "rename_unavailable",

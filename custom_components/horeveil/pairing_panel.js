@@ -505,7 +505,9 @@ class HoreveilAssociation extends HTMLElement {
     this.#element("content").hidden = false;
     const calendars = info.calendars ?? [];
     const eligible = new Set(info.calendar_phones ?? []);
-    const name = (id) => info.phone_labels?.[id] ?? `Téléphone ${id.slice(0, 8)}`;
+    const labelsAvailable = info.phone_labels !== null;
+    const name = (id) => info.phone_labels?.[id]
+      ?? `Téléphone ${id.slice(0, 8)}${labelsAvailable ? "" : " (libellé indisponible)"}`;
     const phones = this.#element("phones");
     this.#element("empty").hidden = info.phones.length > 0;
     phones.hidden = !info.phones.length;
@@ -525,6 +527,7 @@ class HoreveilAssociation extends HTMLElement {
       const actions = document.createElement("div");
       actions.className = "actions";
       const rename = actionButton("Renommer", () => this.#rename(id, info.phone_labels?.[id]));
+      rename.disabled = !labelsAvailable;
       const revoke = actionButton("Révoquer", () => this.#revoke(id, name(id)), "danger");
       rename.setAttribute("aria-label", `Renommer ${name(id)}`);
       revoke.setAttribute("aria-label", `Révoquer ${name(id)}`);
@@ -538,6 +541,11 @@ class HoreveilAssociation extends HTMLElement {
       const title = document.createElement("h3");
       title.textContent = entry.title;
       const current = document.createElement("p");
+      if (entry.source_uncertain) {
+        current.textContent = "Source indéterminée. Rechargez l’intégration ou redémarrez Home Assistant, puis actualisez la liste.";
+        row.append(title, current);
+        return row;
+      }
       const label = document.createElement("label");
       label.className = "field";
       const select = document.createElement("select");

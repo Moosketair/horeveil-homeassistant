@@ -44,6 +44,10 @@ _PANEL_MODULE = "/api/horeveil/pairing-panel.js"
 _PUBLIC_KEY = re.compile(r"[A-Za-z0-9_-]{392}", re.ASCII)
 
 
+class _StorageOutcomeUnknown(PairingError):
+    """The operation reached the Store and its durable result could not be verified."""
+
+
 def _supports_local_test(server) -> bool:
     """Use the actual HTTP server settings, including any Core fallback."""
     return (
@@ -118,12 +122,18 @@ class _PairingRuntime:
             raise PairingError("Invalid phone labels")
         return labels
 
-    async def async_save_labels(self, labels: dict[str, str]) -> None:
+    async def async_save_labels(self, labels: dict[str, str], previous: dict[str, str]) -> None:
         if getattr(self.labels.hass, "is_stopping", False):
             raise PairingError("Home Assistant is stopping")
-        await self.labels.async_save(labels)
-        if await self.labels.async_load() != labels:
-            raise PairingError("Unable to persist phone labels")
+        try:
+            await self.labels.async_save(labels)
+            persisted = await self.labels.async_load()
+        except (HomeAssistantError, OSError, ValueError):
+            raise _StorageOutcomeUnknown("Unable to verify persisted phone labels") from None
+        if persisted == previous:
+            raise PairingError("Previous phone labels were retained")
+        if persisted != labels:
+            raise _StorageOutcomeUnknown("Unable to verify persisted phone labels")
 
     async def async_prune_labels(self) -> None:
         """Reconcile the display store with the authoritative registry under labels_lock."""
@@ -133,7 +143,7 @@ class _PairingRuntime:
                 active = {str(phone) for phone in await self.registry.async_list_active()}
                 labels = {key: value for key, value in previous.items() if key in active}
                 if labels != previous:
-                    await self.async_save_labels(labels)
+                    await self.async_save_labels(labels, previous)
         except (HomeAssistantError, OSError, ValueError):
             _LOGGER.warning("Horéveil could not clean up stored phone labels")
 
@@ -399,7 +409,7 @@ async def _info(hass, connection, msg) -> None:
         try:
             labels = await operation.test.async_load_labels() if active else {}
         except (HomeAssistantError, OSError, ValueError):
-            labels = {}
+            labels = None
     phones = [str(pairing_id) for pairing_id in active]
     result = {
         "suggested_origin": suggestion or operation.test.origin,
@@ -407,7 +417,7 @@ async def _info(hass, connection, msg) -> None:
         "phones": phones,
     }
     if active:
-        result["phone_labels"] = {
+        result["phone_labels"] = None if labels is None else {
             key: labels[key] for key in phones if isinstance(labels.get(key), str)
         }
     if operation.test.proxy is not None:
@@ -418,16 +428,21 @@ async def _info(hass, connection, msg) -> None:
         result["https_origins"] = origins = _https_origins(hass)
         result["suggested_origin"] = origins[0] if origins else None
         result["calendar_phones"] = [str(pairing_id) for pairing_id in signed]
-        result["calendars"] = [
-            {
+        calendars = result["calendars"] = []
+        receivers = hass.data.get(CALENDAR_RECEIVERS, {})
+        for entry in hass.config_entries.async_entries(DOMAIN):
+            if (receiver := receivers.get(entry.entry_id)) is None:
+                continue
+            uncertain = receiver.source_selection_uncertain
+            source = None if uncertain else receiver.direct_source
+            received_at = None if uncertain else receiver.received_at
+            calendars.append({
                 "entry_id": entry.entry_id,
                 "title": entry.title,
-                "pairing_id": str(receiver.direct_source) if receiver.direct_source else None,
-                "last_success": receiver.received_at.isoformat() if receiver.received_at else None,
-            }
-            for entry in hass.config_entries.async_entries(DOMAIN)
-            if (receiver := hass.data.get(CALENDAR_RECEIVERS, {}).get(entry.entry_id)) is not None
-        ]
+                "source_uncertain": uncertain,
+                "pairing_id": str(source) if source else None,
+                "last_success": received_at.isoformat() if received_at else None,
+            })
     operation.result(result)
 
 
@@ -460,8 +475,10 @@ async def _rename(hass, connection, msg) -> None:
             else:
                 labels.pop(phone_id, None)
             if labels != previous:
-                await _persist(lambda: operation.test.async_save_labels(labels))
+                await _persist(lambda: operation.test.async_save_labels(labels, previous))
             operation.result({"state": "renamed"})
+    except _StorageOutcomeUnknown:
+        operation.error("storage_outcome_unknown")
     except (HomeAssistantError, OSError, ValueError):
         operation.error("rename_unavailable")
 
@@ -489,10 +506,15 @@ async def _calendar_source(hass, connection, msg) -> None:
                 for candidate in receivers.values()
             ):
                 return False
-            return await receiver.async_select_source(source)
+            selected = await receiver.async_select_source(source)
+            if not selected and receiver.source_selection_uncertain:
+                raise _StorageOutcomeUnknown("Unable to verify persisted calendar source")
+            return selected
 
         await operation.test.registry.async_select_calendar_source(pairing_id, select)
         operation.result({"state": "selected"})
+    except _StorageOutcomeUnknown:
+        operation.error("storage_outcome_unknown")
     except (HomeAssistantError, OSError, ValueError):
         operation.error("calendar_source_unavailable")
 
