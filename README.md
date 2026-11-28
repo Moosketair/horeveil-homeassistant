@@ -4,6 +4,8 @@ Horéveil reçoit les instantanés `calendar_snapshot` v1 de l’application And
 
 Préversion **0.4.0-beta.2** publiée pour Home Assistant **2026.10 ou ultérieur** et validée sur l’installation de recette. La version stable **0.3.0** reste disponible sur `main`. [Notes de la préversion](docs/SYNCHRONISATION_DIRECTE_3C4C4.md#notes-de-version-040-beta2).
 
+La préversion **0.4.0-beta.3** est préparée localement pour contre-essai. [Notes de version 0.4.0-beta.3](docs/SYNCHRONISATION_DIRECTE_3C4C4.md#notes-de-version-040-beta3).
+
 Ce dépôt est distribué sous [licence MIT](LICENSE).
 
 <!-- ha-marketplace:exclude-start -->

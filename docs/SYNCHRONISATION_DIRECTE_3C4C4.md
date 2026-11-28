@@ -464,3 +464,111 @@ et un navigateur local. La recette Core réel et Android du lot reste à
 faire. La contre-relecture indépendante ciblée porte sur la possibilité
 d’écrire exclusivement sa propre fiche après authentification, l’ordre
 avec la révocation et l’absence de droits supplémentaires.
+
+## Étape 3C4C.7.D — Contre-vérification indépendante du 27 novembre 2026
+
+**Verdict.** Validé sous réserve. La préparation locale de la bêta 3 peut
+continuer. La publication est à différer jusqu’à correction et
+contre-essai du défaut ci-dessous.
+
+La contre-vérification porte sur Home Assistant `2dd8c32` et Android
+`6be3672`. Le HEAD Android `603f3e0` ajoute uniquement du suivi. L’APK
+Debug 2.7.4 build 2 contient `6be3672776e0` dans son DEX et son SHA-256
+correspond au journal Android.
+
+Le contrat des quatre champs facultatifs et leurs limites UTF-8 concordent
+sur les cas vérifiés. L’enrichissement est réservé au HTTPS signé direct.
+Il précède le chiffrement de la file et la signature du corps. Les octets
+déjà en file, l’empreinte métier, la périodicité et les règles de projection
+sont conservés. Le status enrichi est conditionné à une liaison active et
+à l’en-tête de capacité. Il ne peut écrire que la fiche du téléphone
+authentifié et n’accède ni au calendrier ni à l’affectation des sources.
+
+Deux sondes indépendantes ont couvert l’écriture indisponible, la reprise
+sur un doublon exact, les status manuels à révision égale, les deux ordres
+d’arrivée entre calendrier et status, la révocation et le redémarrage. Un
+ancien instantané peut alimenter le calendrier sans écraser une fiche déjà
+actualisée. Un nouveau status à la révision courante reste admissible. Les
+56 tests Python ciblés et les neuf scénarios Chrome ont réussi. Les preuves
+Android réutilisées couvrent 50 tests JVM, cinq scénarios instrumentés et
+le Lint à zéro erreur. Les quatre combinaisons signées du lot précédent
+utilisaient des fixtures.
+
+Sur l’émulateur API 37, deux profils distincts de Core 2026.11.2 ont
+exercé les échanges réels avec `46ab5b2` et `2dd8c32`. La référence
+antérieure disponible `a1d244e97415` a établi l’association et envoyé le
+status historique. L’installation par-dessus de `6be3672776e0` a
+conservé l’association et sa clé. Le nouvel APK a effectué un status sans
+source calendrier en un appel sur la bêta 2 et en deux sur `2dd8c32`.
+Une défaillance injectée du Store a laissé la liaison vérifiée tout en
+signalant l’échec facultatif. Chaque serveur a accepté un instantané
+enrichi de 30 événements. Le panneau de Core a conservé le libellé
+personnalisé et les événements lors du status suivant. Sur `2dd8c32`,
+la fiche, le libellé et le calendrier étaient présents après redémarrage.
+L’instrumentation a fourni une autorité de certification éphémère de
+recette. L’exécution sur S25+, Android 8 et l’installation HACS de la
+bêta 3 restent à qualifier.
+
+**Défaut P2 reproduit sur émulateur et Core réel.** Avec un calendrier
+déjà publié, faire échouer l’écriture de la marque d’oubli dans
+`HomeAssistantPairing.forget()`, après la suppression de la destination
+calendrier dans DataStore. L’association reste lisible avec le même
+`pairing_id`, mais sa révision locale retombe à zéro. Dans deux nouveaux
+processus Android, **Vérifier la liaison** confirme le lien. Core ignore
+les deux mises à jour de révision zéro, la fiche conserve l’ancienne
+version injectée pour la recette et Android n’affiche aucun avis sur
+l’échec d’actualisation. Sans nouvelle révision calendrier, cette fiche
+ne se rétablit pas par une nouvelle vérification de la liaison. La
+reproduction injecte une erreur de stockage entre les deux écritures
+Android. Le calendrier déjà reçu est toujours présent dans Core.
+
+## Étape 3C4C.7.E — Correction du P2 le 28 novembre 2026
+
+Android retire la destination, le consentement et le corps en attente
+dans la même transaction DataStore qui conserve la plus haute révision
+allouée pour ce `pairing_id`. L’écriture séparée de la marque d’oubli
+peut alors échouer sans perdre le seuil. La répétition de l’oubli
+conserve le seuil. Une réactivation explicite du partage pour le même
+lien repart au-dessus de ce seuil, avec une nouvelle sélection des
+alarmes. Une autre association a son propre compteur. La préférence
+résiduelle contient seulement un identifiant d’association et une
+révision. Elle est remplacée lors d’un oubli ultérieur qui conserve
+un nouveau seuil.
+
+La liaison active et le résultat de l’actualisation sont indépendants dans
+Android. `stored` confirme l’enregistrement. `ignored` indique une
+révision trop ancienne ou l’absence de champs valides côté serveur.
+Une erreur facultative est signalée séparément. Le contrat signé
+et les contrôles de révision Home Assistant du lot 3C4C.7.B s’appliquent
+également à l’APK corrigé.
+
+Sur Core réel 2026.11.2 et émulateur Android API 37, la sonde ciblée
+`.venv/3c4c7e_p2.py` réutilise les profils du contre-audit. Avec l’APK
+`6be3672776e0`, l’interruption produit deux status signés
+`(0, ignored)` et conserve la fiche ancienne. Avec `9ee5ef74f8a6`,
+la même injection produit deux status `(1, stored)` et restaure la
+fiche. Un status volontairement ancien reste `ignored` et cet état
+est distinct dans Android. Le calendrier et ses événements restent
+présents après l’interruption, le partage local reste désactivé et
+une vérification après révocation reçoit un refus. Trois tests Python
+ciblés sur la révision, les reprises et la révocation réussissent.
+Les résultats Android sont détaillés dans le suivi de son dépôt.
+
+### Notes de version 0.4.0-beta.3
+
+- La fiche des téléphones associés peut afficher le fabricant, le modèle
+  et les versions d’Horéveil et d’Android. Elle est alimentée par le
+  calendrier signé ou par la vérification manuelle de la liaison depuis
+  un APK Android compatible. Le libellé défini dans Home Assistant reste
+  prioritaire.
+- Le panneau améliore le contraste du bouton d’invitation, place
+  l’actualisation dans l’en-tête de la liste et affiche les réceptions
+  en français dans le fuseau de l’instance.
+- Le compagnon Android de recette corrige la perte du compteur après
+  un oubli interrompu et distingue une actualisation enregistrée,
+  ignorée ou échouée. L’ancienne génération de clients conserve les
+  parcours signés habituels.
+
+Préparation locale pour le contre-essai indépendant du P2. La version
+stable 0.3.0 et le tag public 0.4.0-beta.2 restent les références
+installables à ce stade.
