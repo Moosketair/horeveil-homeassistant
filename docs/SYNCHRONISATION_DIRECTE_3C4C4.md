@@ -572,3 +572,27 @@ Les résultats Android sont détaillés dans le suivi de son dépôt.
 Préparation locale pour le contre-essai indépendant du P2. La version
 stable 0.3.0 et le tag public 0.4.0-beta.2 restent les références
 installables à ce stade.
+
+### Contre-essai indépendant du 28 novembre 2026
+
+Le P2 est levé sur l’APK Debug 2.7.4 build 2, révision embarquée
+`9ee5ef74f8a6`. Après injection de l’échec d’oubli sur émulateur API 37,
+le rejeu avec l’APK de référence `6be3672776e0` a donné deux réponses
+`ignored` à révision 0 et laissé la fiche ancienne. Avec le correctif,
+deux vérifications après arrêt explicite d’Android ont obtenu `stored`
+à révision 1 sur Core 2026.11.2 avec le composant `6186d2a`. La fiche a
+été actualisée, le calendrier reçu a été conservé et le partage est resté
+désactivé. Une révision 0 a produit l’état distinct `ignored`. Après
+révocation, le premier status a refusé la liaison.
+
+La sonde isole le fichier de file du Worker tout en gardant DataStore,
+Keystore et le transport signé réels. Les rapports des 35 tests JVM
+confirment les cas d’oubli répété, de préparation concurrente et d’échec
+facultatif. Les trois tests Python ciblés ont aussi été rejoués avec succès.
+Une association qui avait déjà perdu son compteur avec un ancien APK
+reste à révoquer puis à recréer, suivant le suivi Android.
+
+La préparation locale de `0.4.0-beta.3` est cohérente. Le manifeste,
+les métadonnées HACS et les notes ont été vérifiés. Les chemins
+applicatifs audités en 3C4C.7.D sont inchangés côté Home Assistant.
+Le contre-essai valide le candidat pour une publication sur demande.
